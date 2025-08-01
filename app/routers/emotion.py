@@ -47,3 +47,34 @@ def list_steps(
         .offset(offset)
     )
     return db.exec(stmt).all()
+
+@router.post("/sessions", response_model=EmotionSessionRead)
+def create_emotion_session(
+    session_data: EmotionSessionCreate,
+    db: Session = Depends(get_session),
+):
+    new_session = EmotionSession(**session_data.dict())
+    db.add(new_session)
+    db.commit()
+    db.refresh(new_session)
+    return new_session
+
+@router.post("/steps/generate", response_model=EmotionStepRead)
+def generate_emotion_step(
+    input_data: EmotionStepGenerateInput,
+    db: Session = Depends(get_session),
+):
+    response = generate_noa_response(input_data)
+    new_step = EmotionStep(
+        session_id=input_data.session_id,
+        step_order=input_data.step_order,
+        step_type="gpt_response",
+        user_input=input_data.user_input,
+        gpt_response=response,
+        created_at=datetime.utcnow(),
+        insight_tag=None
+    )
+    db.add(new_step)
+    db.commit()
+    db.refresh(new_step)
+    return new_step

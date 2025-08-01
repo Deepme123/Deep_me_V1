@@ -1,0 +1,55 @@
+```gitignore
+# ✅ Python 기본 무시 대상
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.env.*
+
+# ✅ FastAPI + Uvicorn 로그
+*.log
+
+# ✅ VSCode 설정 (협업자별 설정 충돌 방지)
+.vscode/
+
+# ✅ PyCharm 설정
+.idea/
+
+# ✅ OS별 파일
+.DS_Store
+Thumbs.db
+
+# ✅ Jupyter Notebook 체크포인트 (혹시 있을 경우)
+.ipynb_checkpoints/
+
+# ✅ 테스트 결과/캐시
+htmlcov/
+.coverage
+.tox/
+.cache/
+pytest_cache/
+nosetests.xml
+coverage.xml
+
+# ✅ MyPy, Pylint, Pyright 등 도구의 캐시
+.mypy_cache/
+.pylint.d/
+.pyright/
+
+# ✅ Secret Key or API Key
+secrets.json
+openai_api_key.txt
+
+# ✅ 기타 수동 등록
+*.db
+*.sqlite3
+*.bak
+*.swp
+
+# ✅ 프로젝트 고유
+resources/system_prompt.txt
+```

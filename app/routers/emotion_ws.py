@@ -4,9 +4,9 @@ from uuid import UUID
 from datetime import datetime
 from app.db.session import get_session
 from app.models.emotion import EmotionSession, EmotionStep
-from app.services.llm_service import stream_noa_response
+from app.services.llm_service import stream_noa_response  # 반드시 async generator 형태일 것
 
-import traceback  # 로그 강화를 위한 추가
+import traceback
 
 ws_router = APIRouter()
 
@@ -15,6 +15,7 @@ ws_router = APIRouter()
 async def emotion_chat(websocket: WebSocket):
     await websocket.accept()
     qp = websocket.query_params
+
     try:
         user_id = UUID(qp["user_id"])
     except Exception:
@@ -33,6 +34,7 @@ async def emotion_chat(websocket: WebSocket):
             db.commit()
             db.refresh(sess)
 
+        # 클라이언트에 세션 ID 전송
         await websocket.send_json({"session_id": str(sess.session_id)})
 
         while True:
@@ -57,14 +59,17 @@ async def emotion_chat(websocket: WebSocket):
 
                 # GPT 스트리밍 응답 전송
                 collected_tokens = []
-                for token in stream_noa_response(
+                print("🤖 GPT 응답 스트리밍 시작")
+
+                async for token in stream_noa_response(
                     user_input=user_input,
                     session=sess,
                     recent_steps=recent,
                     system_prompt=system_prompt,
                 ):
                     collected_tokens.append(token)
-                    await websocket.send_json({"token": token})  # 토큰 전송
+                    await websocket.send_json({"token": token})  # 실시간 토큰 전송
+                    print("📤 토큰 전송:", token)
 
                 full_text = "".join(collected_tokens)
                 print("✅ 응답 완료, 저장 시작")
@@ -86,15 +91,16 @@ async def emotion_chat(websocket: WebSocket):
                     "step_id": str(new_step.step_id),
                     "created_at": new_step.created_at.isoformat(),
                 })
-                print("📤 전송 완료")
+                print("📤 저장 완료, 완료 신호 전송")
 
             except WebSocketDisconnect:
                 print("❌ 클라이언트 연결 끊김")
                 break
 
             except Exception as e:
-                print("🚨 예외 발생:", traceback.format_exc())
+                err_msg = traceback.format_exc()
+                print("🚨 예외 발생:", err_msg)
                 await websocket.send_json({
                     "error": str(e),
-                    "traceback": traceback.format_exc()
+                    "traceback": err_msg
                 })

@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from sqlmodel import Session, select
 from app.db.session import get_session
 from app.models.user import User
+from app.core.jwt import create_access_token
 from uuid import uuid4
-from datetime import datetime
+from datetime import datetime, timedelta
 import httpx
 import os
 from urllib.parse import urlencode
@@ -31,7 +32,7 @@ def login_via_google():
     google_oauth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
     return RedirectResponse(url=google_oauth_url)
 
-# ✅ 콜백 - 토큰 교환 + 사용자 정보 → DB 저장
+# ✅ 콜백 - 토큰 교환 + 사용자 정보 → DB 저장 + JWT 발급 + 쿠키 설정
 @auth_router.get("/auth/callback")
 async def google_auth_callback(code: str, db: Session = Depends(get_session)):
     token_url = "https://oauth2.googleapis.com/token"
@@ -78,10 +79,33 @@ async def google_auth_callback(code: str, db: Session = Depends(get_session)):
         db.commit()
         db.refresh(user)
 
-    return {
+    # 4. JWT 생성 및 쿠키 설정
+    jwt_token = create_access_token(
+        {"sub": str(user.id)},
+        expires_delta=timedelta(minutes=60)
+    )
+
+    response = JSONResponse(content={
         "message": "✅ 로그인 성공",
         "user_id": str(user.id),
         "name": user.name,
         "email": user.email,
         "created_at": user.created_at.isoformat(),
-    }
+    })
+    response.set_cookie(
+        key="access_token",
+        value=jwt_token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=3600,
+    )
+
+    return response
+
+# ✅ 로그아웃 엔드포인트 - 쿠키 제거
+@auth_router.get("/auth/logout")
+def logout():
+    response = JSONResponse(content={"message": "👋 로그아웃 완료"})
+    response.delete_cookie("access_token")
+    return response

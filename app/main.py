@@ -6,10 +6,12 @@ from app.db.session import create_all_tables
 from app.models import emotion, task
 from app.routers import emotion
 from app.routers.emotion_ws import ws_router as emotion_ws_router
+from app.routers import auth 
 
 app = FastAPI(title="DEEPME Backend", version="0.1.0")
 app.include_router(emotion.router)
 app.include_router(emotion_ws_router)
+app.include_router(auth.auth_router)
 
 @app.get("/health/db")
 def health_db():

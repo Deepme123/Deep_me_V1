@@ -15,6 +15,10 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
 
 
+if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+    raise RuntimeError("GOOGLE_CLIENT_ID or SECRET is not set in environment variables")
+
+
 @auth_router.get("/auth/login")
 def login_via_google():
     google_oauth_url = (

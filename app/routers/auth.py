@@ -9,6 +9,9 @@ from datetime import datetime, timedelta
 import httpx
 import os
 from urllib.parse import urlencode
+from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi.security import OAuth2PasswordRequestForm
+
 
 auth_router = APIRouter()
 
@@ -109,3 +112,25 @@ def logout():
     response = JSONResponse(content={"message": "👋 로그아웃 완료"})
     response.delete_cookie("access_token")
     return response
+
+# 🔒 예시 사용자 (실제론 DB 사용해야 함)
+FAKE_USERS_DB = {
+    "test@example.com": {
+        "username": "test@example.com",
+        "password": "1234",  # 해싱 전 (실제론 암호화 필요)
+        "user_id": "user-1234"
+    }
+}
+
+@auth_router.post("/auth/token")
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = FAKE_USERS_DB.get(form_data.username)
+    if not user or user["password"] != form_data.password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="잘못된 사용자 이름 또는 비밀번호",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    token = create_access_token(data={"sub": user["user_id"]})
+    return {"access_token": token, "token_type": "bearer"}

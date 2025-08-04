@@ -84,7 +84,7 @@ async def google_auth_callback(code: str, db: Session = Depends(get_session)):
 
     # 4. JWT 생성 및 쿠키 설정
     jwt_token = create_access_token(
-        {"sub": str(user.id)},
+        {str(user.id)},
         expires_delta=timedelta(minutes=60)
     )
 
@@ -132,5 +132,5 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    token = create_access_token(data={"sub": user["user_id"]})
+    token = create_access_token(data={user["user_id"]})
     return {"access_token": token, "token_type": "bearer"}

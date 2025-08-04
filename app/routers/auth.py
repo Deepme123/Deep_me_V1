@@ -1,17 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlmodel import Session, select
 from app.db.session import get_session
 from app.models.user import User
 from app.core.jwt import create_access_token
-from uuid import uuid4
 from datetime import datetime, timedelta
+from uuid import uuid4
 import httpx
 import os
 from urllib.parse import urlencode
-from fastapi import APIRouter, HTTPException, status, Depends
-from fastapi.security import OAuth2PasswordRequestForm
-
 
 auth_router = APIRouter()
 
@@ -84,7 +82,7 @@ async def google_auth_callback(code: str, db: Session = Depends(get_session)):
 
     # 4. JWT 생성 및 쿠키 설정
     jwt_token = create_access_token(
-        {str(user.id)},
+        str(user.id),
         expires_delta=timedelta(minutes=60)
     )
 
@@ -113,16 +111,15 @@ def logout():
     response.delete_cookie("access_token")
     return response
 
-# 🔒 예시 사용자 (실제론 DB 사용해야 함)
+# ✅ Swagger 테스트용 로그인 엔드포인트 (/auth/token)
 FAKE_USERS_DB = {
     "test@example.com": {
-        "username": "test@example.com",
-        "password": "1234",  # 해싱 전 (실제론 암호화 필요)
-        "user_id": "user-1234"
+        "user_id": "user-1234",
+        "password": "1234"
     }
 }
 
-@auth_router.post("/auth/token")
+@auth_router.post("/auth/token", tags=["auth"])
 def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     user = FAKE_USERS_DB.get(form_data.username)
     if not user or user["password"] != form_data.password:
@@ -131,6 +128,6 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
             detail="잘못된 사용자 이름 또는 비밀번호",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    token = create_access_token(data={user["user_id"]})
-    return {"access_token": token, "token_type": "bearer"}
+
+    access_token = create_access_token(user["user_id"])
+    return {"access_token": access_token, "token_type": "bearer"}

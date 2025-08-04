@@ -1,32 +1,21 @@
-from fastapi import Depends, HTTPException, status
+from fastapi import Request
 from fastapi.security import OAuth2PasswordBearer
 from app.core.jwt import decode_access_token
-from fastapi import Request
+from fastapi import Depends, HTTPException, status
 
-# ✅ 토큰을 헤더에서 추출하는 OAuth2PasswordBearer 스키마
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")  # 로그인 경로 (예시)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
-# ✅ 토큰 유효성 검사 및 사용자 ID 반환
-def get_current_user(token: str = Depends(oauth2_scheme)):
-    payload = decode_access_token(token)
+# ✅ 쿠키 또는 헤더에서 토큰을 가져오는 함수
+def get_current_user(request: Request, token: str = Depends(oauth2_scheme)):
+    jwt_token = token or request.cookies.get("access_token")
+    if not jwt_token:
+        raise HTTPException(status_code=401, detail="인증 정보가 없습니다")
+
+    payload = decode_access_token(jwt_token)
     if payload is None or "sub" not in payload:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="유효하지 않은 인증 정보입니다.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return payload["sub"]
-
-
-
-# ✅ 쿠키 기반 인증 함수
-def get_current_user_from_cookie(request: Request):
-    token = request.cookies.get("access_token")
-    if not token:
-        raise HTTPException(status_code=401, detail="인증되지 않았습니다 (쿠키 없음)")
-    
-    payload = decode_access_token(token)
-    if payload is None or "sub" not in payload:
-        raise HTTPException(status_code=401, detail="유효하지 않은 토큰입니다")
-    
     return payload["sub"]

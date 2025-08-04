@@ -16,7 +16,7 @@ app = FastAPI(title="DEEPME Backend", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 또는 ['http://localhost:3000', 'https://your-frontend.com']
+    allow_origins=["https://deep-me-v1.onrender.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

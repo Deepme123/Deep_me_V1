@@ -9,6 +9,7 @@ from app.routers.emotion_ws import ws_router as emotion_ws_router
 from app.routers import auth 
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import auth, user
+from app.routers import task 
 import os
 
 
@@ -26,6 +27,7 @@ app.include_router(emotion.router)
 app.include_router(emotion_ws_router)
 app.include_router(auth.auth_router)
 app.include_router(user.user_router)
+app.include_router(task.router)
 
 
 

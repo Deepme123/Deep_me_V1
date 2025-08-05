@@ -82,13 +82,13 @@ async def google_auth_callback(code: str, db: Session = Depends(get_session)):
 
     # 4. JWT 생성 및 쿠키 설정
     jwt_token = create_access_token(
-        str(user.id),
+        str("user.user_id),
         expires_delta=timedelta(minutes=60)
     )
 
     response = JSONResponse(content={
         "message": "✅ 로그인 성공",
-        "user_id": str(user.id),
+        "user_id": str("user.user_id),
         "name": user.name,
         "email": user.email,
         "created_at": user.created_at.isoformat(),

@@ -6,7 +6,7 @@ from datetime import datetime
 # 1. 감정 세션 모델
 class EmotionSession(SQLModel, table=True):
     session_id: UUID = Field(default_factory=uuid4, primary_key=True)
-    user_id: UUID = Field(foreign_key="user.id")  # 이 참조가 이제 정확히 매칭됨
+    user_id: UUID = Field(foreign_key=""user.user_id")  # 이 참조가 이제 정확히 매칭됨
     started_at: datetime = Field(default_factory=datetime.utcnow)
     ended_at: Optional[datetime] = None
 

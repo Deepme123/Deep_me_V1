@@ -23,4 +23,15 @@ def _load(path: Path) -> str:
 def get_system_prompt() -> str:
     return _load(PROMPT_PATH)
 
+TASK_PROMPT_PATH = BASE_DIR / "resources" / "task_prompt.txt"
+
+def get_task_prompt() -> str:
+    try:
+        txt = TASK_PROMPT_PATH.read_text(encoding="utf-8")
+        return txt.strip()
+    except FileNotFoundError:
+        raise RuntimeError("[PromptLoader] task_prompt.txt not found.")
+
+
 SYSTEM_PROMPT = get_system_prompt()
+

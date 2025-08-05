@@ -1,14 +1,7 @@
 from pathlib import Path
 import logging
 from functools import lru_cache
-import os
 
-# ─────────────────────────────
-# 환경 설정 (DEBUG 여부)
-DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-
-# ─────────────────────────────
-# 프롬프트 경로 설정
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 PROMPT_PATH = BASE_DIR / "resources" / "system_prompt.txt"
 
@@ -20,17 +13,14 @@ FALLBACK_PROMPT = (
 def _load(path: Path) -> str:
     try:
         txt = path.read_text(encoding="utf-8")
-        if DEBUG:
-            logging.info(f"[PromptLoader] ✅ system_prompt loaded from '{path}'.")
+        # 운영 환경이라면, 굳이 경로 출력할 필요 없음
         return txt.strip()
     except FileNotFoundError:
-        logging.warning(
-            f"[PromptLoader] ⚠️ '{path}' not found. Using fallback prompt.")
+        logging.warning("[PromptLoader] system_prompt.txt not found. Using fallback.")
         return FALLBACK_PROMPT
 
 @lru_cache(maxsize=1)
 def get_system_prompt() -> str:
     return _load(PROMPT_PATH)
 
-# 기존 코드와 호환성을 위해 상수도 제공
 SYSTEM_PROMPT = get_system_prompt()

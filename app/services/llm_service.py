@@ -2,22 +2,7 @@ from typing import Optional, List, Generator
 from openai import OpenAI
 from app.models.emotion import EmotionSession, EmotionStep
 from app.core.prompt_loader import get_system_prompt
-import logging
-import os
 
-# ─────────────────────────────
-# 환경 설정
-DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-
-logger = logging.getLogger("noa")
-logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
-ch = logging.StreamHandler()
-formatter = logging.Formatter("[%(levelname)s] %(message)s")
-ch.setFormatter(formatter)
-logger.addHandler(ch)
-
-# ─────────────────────────────
-# LLM 설정
 LLM_MODEL = "gpt-3.5-turbo"
 LLM_TEMPERATURE = 0.7
 LLM_MAX_TOKENS = 800
@@ -26,9 +11,7 @@ client = OpenAI()
 
 def _condense_history(history: list[str], max_chars: int = 1000) -> str:
     combined = "\n".join(history).strip()
-    if len(combined) <= max_chars:
-        return combined
-    return "...\n" + combined[-max_chars:]
+    return combined if len(combined) <= max_chars else "...\n" + combined[-max_chars:]
 
 
 def _build_messages(
@@ -39,34 +22,21 @@ def _build_messages(
     system_prompt: Optional[str] = None,
 ) -> List[dict]:
     sys = system_prompt or get_system_prompt()
-    ctx_parts: list[str] = []
+
+    context_parts = []
     if emotion_label:
-        ctx_parts.append(f"감정: {emotion_label}")
+        context_parts.append(f"감정: {emotion_label}")
     if topic:
-        ctx_parts.append(f"주제: {topic}")
+        context_parts.append(f"주제: {topic}")
     if history_snippet:
-        ctx_parts.append(f"최근 대화:\n{history_snippet}")
-
-    context_block = "\n".join(ctx_parts).strip()
-
+        context_parts.append(f"최근 대화:\n{history_snippet}")
+    
     messages = [{"role": "system", "content": sys}]
-    if context_block:
-        messages.append({"role": "user", "content": context_block})
+    if context_parts:
+        messages.append({"role": "user", "content": "\n".join(context_parts)})
     messages.append({"role": "user", "content": user_input})
 
-    if DEBUG:
-        redacted = _redact_prompt(messages)
-        logger.debug("🔍 메시지 (프롬프트 구조): %s", redacted)
-
     return messages
-
-
-def _redact_prompt(messages: List[dict]) -> List[dict]:
-    """시스템 프롬프트 등 민감한 내용 마스킹"""
-    return [
-        {"role": m["role"], "content": "[시스템 프롬프트 생략]" if m["role"] == "system" else m["content"]}
-        for m in messages
-    ]
 
 
 def generate_noa_response(
@@ -86,7 +56,6 @@ def generate_noa_response(
         ]),
         system_prompt,
     )
-
     resp = client.chat.completions.create(
         model=LLM_MODEL,
         messages=messages,
@@ -105,7 +74,6 @@ def stream_noa_response(
     temperature: float = LLM_TEMPERATURE,
     max_tokens: int = 400,
 ) -> Generator[str, None, None]:
-    """토큰 단위 GPT 응답을 yield"""
     messages = _build_messages(
         user_input,
         session.emotion_label,

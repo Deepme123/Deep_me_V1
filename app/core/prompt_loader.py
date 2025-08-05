@@ -1,9 +1,15 @@
 from pathlib import Path
 import logging
 from functools import lru_cache
+import os
 
-# 프로젝트 루트 기준 절대 경로 구하기
-BASE_DIR = Path(__file__).resolve().parent.parent.parent  # .../app/core → project root
+# ─────────────────────────────
+# 환경 설정 (DEBUG 여부)
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
+# ─────────────────────────────
+# 프롬프트 경로 설정
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
 PROMPT_PATH = BASE_DIR / "resources" / "system_prompt.txt"
 
 FALLBACK_PROMPT = (
@@ -14,11 +20,12 @@ FALLBACK_PROMPT = (
 def _load(path: Path) -> str:
     try:
         txt = path.read_text(encoding="utf-8")
-        logging.info(f"[PromptLoader] system_prompt loaded from '{path}'.")
+        if DEBUG:
+            logging.info(f"[PromptLoader] ✅ system_prompt loaded from '{path}'.")
         return txt.strip()
     except FileNotFoundError:
         logging.warning(
-            f"[PromptLoader] '{path}' not found. Using fallback prompt.")
+            f"[PromptLoader] ⚠️ '{path}' not found. Using fallback prompt.")
         return FALLBACK_PROMPT
 
 @lru_cache(maxsize=1)

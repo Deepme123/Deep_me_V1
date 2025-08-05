@@ -6,12 +6,12 @@ from datetime import datetime
 # 1. 감정 세션 모델
 class EmotionSession(SQLModel, table=True):
     session_id: UUID = Field(default_factory=uuid4, primary_key=True)
-    user_id: UUID = Field(foreign_key="user.user_id")  # 🔄 외래키 복원
+    user_id: UUID = Field(foreign_key="user.user_id")  # 이 참조가 이제 정확히 매칭됨
     started_at: datetime = Field(default_factory=datetime.utcnow)
     ended_at: Optional[datetime] = None
 
-    emotion_label: Optional[str] = None      # 예: 무시당함
-    topic: Optional[str] = None              # 예: 가족, 회사
+    emotion_label: Optional[str] = None
+    topic: Optional[str] = None
     trigger_summary: Optional[str] = None
     insight_summary: Optional[str] = None
 
@@ -21,9 +21,9 @@ class EmotionSession(SQLModel, table=True):
 # 2. 감정 단계(스텝) 모델
 class EmotionStep(SQLModel, table=True):
     step_id: UUID = Field(default_factory=uuid4, primary_key=True)
-    session_id: UUID = Field(foreign_key="emotionsession.session_id")  # 그대로 유지
+    session_id: UUID = Field(foreign_key="emotionsession.session_id")
     step_order: int
-    step_type: str                 # 예: 감정탐색, 사고탐색 등
+    step_type: str
     user_input: str
     gpt_response: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -31,5 +31,6 @@ class EmotionStep(SQLModel, table=True):
     insight_tag: Optional[str] = None
 
     session: Optional[EmotionSession] = Relationship(back_populates="steps")
+
 
 

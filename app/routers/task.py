@@ -23,7 +23,7 @@ def create_task(
     db: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    task.user_id = user.user_id
+    task.user_id = user.id
     db.add(task)
     db.commit()
     db.refresh(task)
@@ -35,7 +35,7 @@ def get_all_tasks(
     db: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    stmt = select(Task).where(Task.user_id == user.user_id)
+    stmt = select(Task).where(Task.user_id == user.id)
     return db.exec(stmt).all()
 
 
@@ -46,7 +46,7 @@ def get_task(
     user: User = Depends(get_current_user),
 ):
     task = db.get(Task, task_id)
-    if not task or task.user_id != user.user_id:
+    if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
 
@@ -59,7 +59,7 @@ def update_task(
     user: User = Depends(get_current_user),
 ):
     task = db.get(Task, task_id)
-    if not task or task.user_id != user.user_id:
+    if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
 
     task.title = updated.title or task.title
@@ -77,7 +77,7 @@ def complete_task(
     user: User = Depends(get_current_user),
 ):
     task = db.get(Task, task_id)
-    if not task or task.user_id != user.user_id:
+    if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
 
     task.is_completed = True
@@ -97,7 +97,7 @@ def delete_task(
     user: User = Depends(get_current_user),
 ):
     task = db.get(Task, task_id)
-    if not task or task.user_id != user.user_id:
+    if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
     db.delete(task)
     db.commit()
@@ -143,7 +143,7 @@ def recommend_tasks_from_gpt(
         if not title:
             continue
         t = Task(
-            user_id=user.user_id,
+            user_id=user.id,
             title=title,
             description=description or None,
         )
@@ -172,7 +172,7 @@ def recommend_tasks_from_session(
 ):
     # 1) 세션 유효성/소유권 검사
     sess = db.get(EmotionSession, payload.session_id)
-    if not sess or sess.user_id != user.user_id:
+    if not sess or sess.user_id != user.id:
         raise HTTPException(status_code=404, detail="Emotion session not found")
 
     # 2) 최근 스텝 조회
@@ -249,7 +249,7 @@ def recommend_tasks_from_session(
         description = (item.get("description") or "").strip()
         if not title:
             continue
-        t = Task(user_id=user.user_id, title=title, description=description or None)
+        t = Task(user_id=user.id, title=title, description=description or None)
         db.add(t)
         tasks_out.append(t)
 

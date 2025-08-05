@@ -11,8 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routers import auth, user
 from app.routers import task 
 import os
+from app.core.logging_config import setup_logging
 
 
+setup_logging()
 app = FastAPI(title="DEEPME Backend", version="0.1.0")
 
 app.add_middleware(

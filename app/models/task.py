@@ -1,11 +1,13 @@
-# app/models/task.py
 from sqlmodel import SQLModel, Field
-from typing import Optional
+from uuid import UUID, uuid4
 from datetime import datetime
+from typing import Optional
 
-class UserTask(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: str
-    task: str
-    is_recommended: bool = False
+class Task(SQLModel, table=True):
+    task_id: UUID = Field(default_factory=uuid4, primary_key=True)
+    user_id: UUID = Field(foreign_key="user.user_id")
+    title: str
+    description: Optional[str] = None
+    is_completed: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    completed_at: Optional[datetime] = None

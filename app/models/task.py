@@ -5,7 +5,7 @@ from typing import Optional
 
 class Task(SQLModel, table=True):
     task_id: UUID = Field(default_factory=uuid4, primary_key=True)
-    user_id: UUID = Field(foreign_key="user.user_id")
+    user_id: UUID = Field(foreign_key="user.id")
     title: str
     description: Optional[str] = None
     is_completed: bool = False

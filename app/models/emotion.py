@@ -6,7 +6,7 @@ from datetime import datetime
 # 1. 감정 세션 모델
 class EmotionSession(SQLModel, table=True):
     session_id: UUID = Field(default_factory=uuid4, primary_key=True)
-    user_id: UUID
+    user_id: UUID = Field(foreign_key="user.user_id")  # 🔄 외래키 복원
     started_at: datetime = Field(default_factory=datetime.utcnow)
     ended_at: Optional[datetime] = None
 
@@ -17,10 +17,11 @@ class EmotionSession(SQLModel, table=True):
 
     steps: List["EmotionStep"] = Relationship(back_populates="session")
 
+
 # 2. 감정 단계(스텝) 모델
 class EmotionStep(SQLModel, table=True):
     step_id: UUID = Field(default_factory=uuid4, primary_key=True)
-    session_id: UUID = Field(foreign_key="emotionsession.session_id")
+    session_id: UUID = Field(foreign_key="emotionsession.session_id")  # 그대로 유지
     step_order: int
     step_type: str                 # 예: 감정탐색, 사고탐색 등
     user_input: str
@@ -30,4 +31,5 @@ class EmotionStep(SQLModel, table=True):
     insight_tag: Optional[str] = None
 
     session: Optional[EmotionSession] = Relationship(back_populates="steps")
+
 

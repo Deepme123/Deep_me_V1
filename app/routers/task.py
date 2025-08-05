@@ -5,7 +5,7 @@ from uuid import UUID
 from app.models.task import Task
 from app.db.session import get_session
 from app.models.user import User
-from app.routers.auth import get_current_user  # JWT 인증 기반 유저 추출
+from app.dependencies.auth import get_current_user  # JWT 인증 기반 유저 추출
 from app.core.prompt_loader import get_task_prompt
 from openai import OpenAI
 

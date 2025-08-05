@@ -3,17 +3,18 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlmodel import Session, select
 from uuid import UUID
 from datetime import datetime
+import asyncio
+import logging
+
 from app.db.session import get_session
 from app.models.emotion import EmotionSession, EmotionStep
-from app.services.llm_service import stream_noa_response
-
-# 과제 추천 코어 (동기 OpenAI → to_thread로 오프로드)
-from app.services.task_recommend import recommend_tasks_from_session_core
 from app.models.task import Task  # (타입 힌트/포맷용)
-import asyncio
-import traceback  # 로그 강화를 위한 추가
+from app.services.llm_service import stream_noa_response
+from app.services.task_recommend import recommend_tasks_from_session_core
+from app.core.jwt import decode_access_token  # JWT 디코드 함수 (프로젝트 구현에 맞게 import)
 
 ws_router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _should_recommend_tasks(user_text: str, sess: EmotionSession) -> bool:
@@ -44,22 +45,45 @@ def _format_tasks_as_chat(tasks: list[Task]) -> str:
 
 @ws_router.websocket("/ws/emotion")
 async def emotion_chat(websocket: WebSocket):
-    await websocket.accept()
-    qp = websocket.query_params
+    # ── 1) 인증: Authorization 헤더(또는 쿠키)에서 토큰 추출 및 검증 ──
+    token = None
+    auth = websocket.headers.get("authorization")
+    if auth and auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+    if not token:
+        # 쿠키를 쓰는 경우
+        token = websocket.cookies.get("access_token")
+    if not token:
+        # 인증 없음 → 연결 거부
+        await websocket.close(code=4401)  # Unauthorized
+        return
+
     try:
-        user_id = UUID(qp["user_id"])
+        payload = decode_access_token(token)  # 프로젝트의 JWT 디코더 사용
+        user_id = UUID(payload["sub"])       # 신뢰 원천은 토큰의 sub
     except Exception:
-        await websocket.close(code=4001)
+        await websocket.close(code=4403)      # Forbidden
+        return
+
+    # 인증 통과 후에만 accept
+    await websocket.accept()
+
+    # (선택) 쿼리스트링 user_id가 왔다면 토큰의 sub와 일치 여부만 체크
+    qp = websocket.query_params
+    qp_user_id = qp.get("user_id")
+    if qp_user_id and qp_user_id != str(user_id):
+        await websocket.close(code=4403)
         return
 
     session_id_param = qp.get("session_id")
-    print(f"🔗 WebSocket 연결: user_id={user_id}, session_id={session_id_param}")
+    logger.info("WS connected user_id=%s session_id=%s", user_id, session_id_param)
 
+    # ── DB 세션 컨텍스트 ──
     with next(get_session()) as db:
         # 세션 확보/생성
         sess = db.get(EmotionSession, UUID(session_id_param)) if session_id_param else None
         if sess is None:
-            print("🆕 세션 새로 생성")
+            logger.info("Create new emotion session for user=%s", user_id)
             sess = EmotionSession(user_id=user_id, started_at=datetime.utcnow())
             db.add(sess)
             db.commit()
@@ -71,7 +95,8 @@ async def emotion_chat(websocket: WebSocket):
         while True:
             try:
                 req = await websocket.receive_json()
-                print("📩 받은 요청:", req)
+                # 민감 데이터 직접 로깅 금지 → 키 정도만
+                logger.debug("WS request received (keys=%s)", list(req.keys()))
 
                 user_input = (req.get("user_input") or "").strip()
                 if not user_input:
@@ -87,25 +112,24 @@ async def emotion_chat(websocket: WebSocket):
                     .where(EmotionStep.session_id == sess.session_id)
                     .order_by(EmotionStep.step_order)
                 ).all()
-                print(f"📜 최근 스텝 수: {len(recent)}")
+                logger.debug("Recent steps: %d", len(recent))
 
-                # 1) GPT 스트리밍 응답 전송
+                # ── 1) GPT 스트리밍 응답 전송 ──
                 collected_tokens = []
-                for token in stream_noa_response(
+                for token_piece in stream_noa_response(
                     user_input=user_input,
                     session=sess,
                     recent_steps=recent,
                     system_prompt=system_prompt,
                 ):
-                    if token:
-                        collected_tokens.append(token)
-                        await websocket.send_json({"token": token})  # 토큰 스트림
+                    if token_piece:
+                        collected_tokens.append(token_piece)
+                        await websocket.send_json({"token": token_piece})  # 토큰 스트림
 
-                # 2) 2초 지연 후 과제 추천(조건 충족 시)
-                tasks_text = ""
+                # ── 2) 2초 지연 후 과제 추천(조건 충족 시) ──
                 try:
                     if _should_recommend_tasks(user_input, sess):
-                        await asyncio.sleep(2)  # ✅ 자연스러운 템포를 위한 지연
+                        await asyncio.sleep(2)  # 자연스러운 템포 지연
                         tasks = await asyncio.to_thread(
                             recommend_tasks_from_session_core,
                             user_id=user_id,
@@ -119,11 +143,12 @@ async def emotion_chat(websocket: WebSocket):
                         await websocket.send_json({"token": tasks_text})
                         collected_tokens.append(tasks_text)
                 except Exception:
-                    print("⚠️ 과제 추천 중 오류:", traceback.format_exc())
+                    # 외부에 스택트레이스 노출 금지
+                    logger.exception("task recommendation failed")
 
-                # 3) 최종 텍스트(과제 포함) 저장
+                # ── 3) 최종 텍스트(과제 포함) 저장 ──
                 full_text = "".join(collected_tokens)
-                print("✅ 응답 완료, 저장 시작")
+                logger.debug("LLM stream done. Persist step.")
 
                 new_step = EmotionStep(
                     session_id=sess.session_id,
@@ -137,20 +162,18 @@ async def emotion_chat(websocket: WebSocket):
                 db.commit()
                 db.refresh(new_step)
 
-                # 4) 완료 신호
+                # ── 4) 완료 신호 ──
                 await websocket.send_json({
                     "done": True,
                     "step_id": str(new_step.step_id),
                     "created_at": new_step.created_at.isoformat(),
                 })
-                print("📤 전송 완료")
+                logger.debug("WS send done signal: step_id=%s", new_step.step_id)
 
             except WebSocketDisconnect:
-                print("❌ 클라이언트 연결 끊김")
+                logger.info("WS disconnected user_id=%s", user_id)
                 break
             except Exception:
-                print("🚨 예외 발생:", traceback.format_exc())
-                await websocket.send_json({
-                    "error": "internal_error",
-                    "traceback": traceback.format_exc(),
-                })
+                # 내부에만 스택트레이스 기록, 외부는 일반화된 에러만
+                logger.exception("WS error")
+                await websocket.send_json({"error": "internal_error"})

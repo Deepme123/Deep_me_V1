@@ -5,6 +5,7 @@ from uuid import UUID
 from datetime import datetime
 import asyncio
 import logging
+import inspect
 
 from app.db.session import get_session
 from app.models.emotion import EmotionSession, EmotionStep
@@ -37,24 +38,48 @@ def _format_tasks_as_chat(tasks: list[Task]) -> str:
     """과제 추천을 자연스러운 챗 형태 텍스트로 변환."""
     lines = ["", "📝 활동과제 추천"]
     for i, t in enumerate(tasks, 1):
-        desc = f"\n   - {t.description}" if t.description else ""
+        desc = f"\n   - {t.description}" if getattr(t, "description", None) else ""
         lines.append(f"{i}. {t.title}{desc}")
     lines.append("\n작게 시작하고, 완료하면 체크해줘. ✅")
     return "\n".join(lines)
 
 
+async def _agen(gen):
+    """
+    stream_noa_response 가 sync generator 또는 async generator 둘 다 가능하도록 래핑.
+    """
+    if inspect.isasyncgen(gen):
+        async for x in gen:
+            yield x
+    else:
+        for x in gen:
+            yield x
+
+
 @ws_router.websocket("/ws/emotion")
 async def emotion_chat(websocket: WebSocket):
-    # ── 1) 인증: Authorization 헤더(또는 쿠키)에서 토큰 추출 및 검증 ──
+    # ── 0) 핸드셰이크 직전 로깅(인증 전달 여부만) ──
+    has_auth_header = bool(websocket.headers.get("authorization"))
+    has_cookie = bool(websocket.cookies.get("access_token"))
+    logger.info(
+        "WS handshake: auth_header=%s cookie=%s url=%s",
+        has_auth_header, has_cookie, websocket.url
+    )
+
+    # ── 1) 일단 업그레이드(accept) → 이후 인증 검증(디버깅 가시성 ↑) ──
+    await websocket.accept()
+
+    # ── 2) 인증: Authorization 헤더(또는 쿠키)에서 토큰 추출 및 검증 ──
     token = None
     auth = websocket.headers.get("authorization")
     if auth and auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
     if not token:
-        # 쿠키를 쓰는 경우
+        # 브라우저의 경우 쿠키 인증
         token = websocket.cookies.get("access_token")
+
     if not token:
-        # 인증 없음 → 연결 거부
+        await websocket.send_json({"error": "unauthorized"})
         await websocket.close(code=4401)  # Unauthorized
         return
 
@@ -62,17 +87,16 @@ async def emotion_chat(websocket: WebSocket):
         payload = decode_access_token(token)  # 프로젝트의 JWT 디코더 사용
         user_id = UUID(payload["sub"])       # 신뢰 원천은 토큰의 sub
     except Exception:
-        await websocket.close(code=4403)      # Forbidden
+        await websocket.send_json({"error": "invalid_token"})
+        await websocket.close(code=4401)
         return
-
-    # 인증 통과 후에만 accept
-    await websocket.accept()
 
     # (선택) 쿼리스트링 user_id가 왔다면 토큰의 sub와 일치 여부만 체크
     qp = websocket.query_params
     qp_user_id = qp.get("user_id")
     if qp_user_id and qp_user_id != str(user_id):
-        await websocket.close(code=4403)
+        await websocket.send_json({"error": "forbidden_user"})
+        await websocket.close(code=4403)  # Forbidden
         return
 
     session_id_param = qp.get("session_id")
@@ -81,7 +105,12 @@ async def emotion_chat(websocket: WebSocket):
     # ── DB 세션 컨텍스트 ──
     with next(get_session()) as db:
         # 세션 확보/생성
-        sess = db.get(EmotionSession, UUID(session_id_param)) if session_id_param else None
+        sess = None
+        if session_id_param:
+            try:
+                sess = db.get(EmotionSession, UUID(session_id_param))
+            except Exception:
+                sess = None
         if sess is None:
             logger.info("Create new emotion session for user=%s", user_id)
             sess = EmotionSession(user_id=user_id, started_at=datetime.utcnow())
@@ -116,11 +145,13 @@ async def emotion_chat(websocket: WebSocket):
 
                 # ── 1) GPT 스트리밍 응답 전송 ──
                 collected_tokens = []
-                for token_piece in stream_noa_response(
-                    user_input=user_input,
-                    session=sess,
-                    recent_steps=recent,
-                    system_prompt=system_prompt,
+                async for token_piece in _agen(
+                    stream_noa_response(
+                        user_input=user_input,
+                        session=sess,
+                        recent_steps=recent,
+                        system_prompt=system_prompt,
+                    )
                 ):
                     if token_piece:
                         collected_tokens.append(token_piece)

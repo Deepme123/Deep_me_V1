@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Tuple
 from uuid import UUID, uuid4
 
-import jwt
+from jose import jwt  # ← python-jose 사용
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -27,7 +27,7 @@ REFRESH_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "21"))
 
 REFRESH_COOKIE_NAME = os.getenv("REFRESH_COOKIE_NAME", "__Host-deepme_rtok")
 SECURE_COOKIE = _env_bool("SECURE_COOKIE", True)
-SAMESITE_COOKIE = os.getenv("SAMESITE_COOKIE", "Lax")
+SAMESITE_COOKIE = os.getenv("SAMESITE_COOKIE", "lax")  # 'lax' | 'strict' | 'none'
 
 
 # ---- 공통 ----
@@ -47,6 +47,7 @@ def _make_jwt(payload: Dict[str, Any], secret: str, exp: datetime) -> str:
 
 
 def _decode(token: str, secret: str) -> Dict[str, Any]:
+    # jose.jwt.decode는 검증 실패 시 jose.exceptions.JWTError를 던짐
     return jwt.decode(token, secret, algorithms=[ALG])
 
 
@@ -65,7 +66,8 @@ def create_access_token(sub: UUID, extra: Dict[str, Any] | None = None) -> str:
 def verify_access_token(token: str) -> Dict[str, Any]:
     payload = _decode(token, ACCESS_SECRET)
     if payload.get("typ") != "access":
-        raise jwt.InvalidTokenError("Invalid token type")
+        from jose.exceptions import JWTError
+        raise JWTError("Invalid token type")
     return payload
 
 
@@ -84,17 +86,19 @@ def create_refresh_token(sub: UUID, jti: str) -> Tuple[str, datetime]:
 def verify_refresh_token(token: str) -> Dict[str, Any]:
     payload = _decode(token, REFRESH_SECRET)
     if payload.get("typ") != "refresh":
-        raise jwt.InvalidTokenError("Invalid token type")
+        from jose.exceptions import JWTError
+        raise JWTError("Invalid token type")
     required = ("sub", "jti", "exp")
     for k in required:
         if k not in payload:
-            raise jwt.InvalidTokenError(f"Missing {k}")
+            from jose.exceptions import JWTError
+            raise JWTError(f"Missing {k}")
     return payload
 
 
 # ---- 쿠키 ----
 def set_refresh_cookie(response, token: str):
-    # 개발에서 https가 아니면 SECURE_COOKIE=false로 .env 조정
+    # 개발에서 http라면 .env에서 SECURE_COOKIE=false 설정 필요
     response.set_cookie(
         key=REFRESH_COOKIE_NAME,
         value=token,

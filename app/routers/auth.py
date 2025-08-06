@@ -4,6 +4,8 @@ import os
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
+from app.core.jwt import create_access_token
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Response, Request, status
@@ -184,9 +186,8 @@ def login_via_google():
         "redirect_uri": REDIRECT_URI,
         "response_type": "code",
         "scope": "openid email profile",
-        # 필요 시: "prompt": "consent", "access_type": "offline"
     }
-    return RedirectResponse(url=f"{GOOGLE_AUTH_URL}?{os.environ.get('URLENCODE_OVERRIDE') or ''}{'' if os.environ.get('URLENCODE_OVERRIDE') else ''}{''}".join([f"{k}={v}" for k, v in params.items()]))
+    return RedirectResponse(url=f"{GOOGLE_AUTH_URL}?{urlencode(params)}")
 
 @auth_router.get("/auth/callback", response_model=AuthTokenModel, tags=["auth"])
 async def google_auth_callback(

@@ -1,5 +1,4 @@
 # app/routers/emotion_ws.py
-# app/routers/emotion_ws.py
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlmodel import Session, select
 from uuid import UUID
@@ -7,7 +6,6 @@ from datetime import datetime
 import asyncio
 import logging
 import inspect
-import os
 
 from app.db.session import get_session
 from app.models.emotion import EmotionSession, EmotionStep
@@ -18,9 +16,6 @@ from app.core.jwt import decode_access_token  # JWT 디코드 함수
 
 ws_router = APIRouter()
 logger = logging.getLogger(__name__)
-
-# 쿼리스트링으로 토큰 허용(개발/임시용). 운영에선 false 권장
-WS_ALLOW_QUERY_TOKEN = os.getenv("WS_ALLOW_QUERY_TOKEN", "false").lower() == "true"
 
 
 def _should_recommend_tasks(user_text: str, sess: EmotionSession) -> bool:
@@ -51,49 +46,30 @@ async def _agen(gen):
             yield x
 
 
-def _extract_token(websocket: WebSocket) -> tuple[str | None, str]:
-    """헤더→쿠키→쿼리(옵션) 순으로 토큰 추출."""
-    # 1) Authorization 헤더
-    auth = websocket.headers.get("authorization")
-    if auth and auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1].strip(), "header"
-
-    # 2) 쿠키
-    cookie_token = websocket.cookies.get("access_token")
-    if cookie_token:
-        return cookie_token, "cookie"
-
-    # 3) 쿼리(옵션)
-    if WS_ALLOW_QUERY_TOKEN:
-        q_token = websocket.query_params.get("token")
-        if q_token:
-            return q_token, "query"
-
-    return None, "none"
-
-
 @ws_router.websocket("/ws/emotion")
 async def emotion_chat(websocket: WebSocket):
-    # ── 핸드셰이크 로그(인증 전달 여부만) ──
+    # ── 0) 핸드셰이크 직전 로깅(인증 전달 여부만) ──
     has_auth_header = bool(websocket.headers.get("authorization"))
-    has_cookie = bool(websocket.cookies.get("access_token"))
-    has_q_token = bool(websocket.query_params.get("token"))
     logger.info(
-        "WS handshake: auth_header=%s cookie=%s q_token=%s url=%s",
-        has_auth_header, has_cookie, has_q_token, websocket.url
+        "WS handshake(app-mode): auth_header=%s url=%s",
+        has_auth_header, websocket.url
     )
 
-    # 디버깅 가시성 위해 우선 업그레이드
+    # ── 1) 디버깅 가시성을 위해 먼저 업그레이드 ──
     await websocket.accept()
 
-    # 인증 토큰 추출
-    token, source = _extract_token(websocket)
+    # ── 2) 인증: Authorization 헤더(반드시 Bearer)만 허용 ──
+    token = None
+    auth = websocket.headers.get("authorization")
+    if auth and auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+
     if not token:
-        await websocket.send_json({"error": "unauthorized", "reason": "no_token"})
+        # 쿠키/쿼리 토큰은 사용하지 않음(앱 기준)
+        await websocket.send_json({"error": "unauthorized", "reason": "missing_authorization_header"})
         await websocket.close(code=4401)
         return
 
-    # 토큰 검증
     try:
         payload = decode_access_token(token)
         user_id = UUID(payload["sub"])  # 신뢰 원천은 토큰의 sub
@@ -111,7 +87,7 @@ async def emotion_chat(websocket: WebSocket):
         return
 
     session_id_param = qp.get("session_id")
-    logger.info("WS connected user_id=%s via=%s session_id=%s", user_id, source, session_id_param)
+    logger.info("WS connected user_id=%s session_id=%s", user_id, session_id_param)
 
     # ── DB 세션 컨텍스트 ──
     with next(get_session()) as db:

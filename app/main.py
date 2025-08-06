@@ -12,6 +12,7 @@ from app.routers import auth, user
 from app.routers import task 
 import os
 from app.core.logging_config import setup_logging
+from app.models import refresh_token
 
 
 setup_logging()

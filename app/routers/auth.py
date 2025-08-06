@@ -22,7 +22,7 @@ if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
     raise RuntimeError("❌ GOOGLE_CLIENT_ID 또는 SECRET이 설정되지 않았습니다 (.env 확인 요망)")
 
 # ✅ 로그인 진입점 - 구글 OAuth URL로 리디렉션
-@auth_router.get("/auth/login")
+@auth_router.get("/auth/login/google")
 def login_via_google():
     params = {
         "client_id": GOOGLE_CLIENT_ID,

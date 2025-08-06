@@ -10,6 +10,26 @@ from datetime import timedelta
 import httpx
 import os
 from urllib.parse import urlencode
+from datetime import datetime
+from typing import Optional
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Response, Request, status
+from sqlmodel import Session, select
+
+from app.db.session import get_session
+from app.models.user import User
+from app.models.refresh_token import RefreshToken
+from app.core.tokens import (
+    create_access_token,
+    create_refresh_token,
+    verify_refresh_token,
+    new_refresh_jti,
+    sha256_hex,
+    set_refresh_cookie,
+    clear_refresh_cookie,
+    REFRESH_COOKIE_NAME,
+)
 
 auth_router = APIRouter()
 
@@ -216,3 +236,179 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
         )
     access_token = create_access_token(user["user_id"])
     return {"access_token": access_token, "token_type": "bearer"}
+
+
+
+# 이미 선언된 라우터가 있으면 그걸 사용하고, 없으면 아래 주석 해제
+# auth_router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def issue_tokens_for_user(
+    db: Session,
+    user: User,
+    response: Response,
+    user_agent: Optional[str] = None,
+    ip: Optional[str] = None,
+) -> dict:
+    """
+    로그인 성공 시 호출: AT 발급 + RT 생성/저장 + RT 쿠키 세팅
+    """
+    # 1) Access Token
+    access_token = create_access_token(user.user_id)
+
+    # 2) Refresh Token (회전 전제)
+    jti = new_refresh_jti()
+    refresh_token, exp = create_refresh_token(user.user_id, jti)
+
+    # 3) DB 저장(원문은 저장하지 않고 해시만 저장)
+    db.add(
+        RefreshToken(
+            jti=jti,
+            user_id=user.user_id,
+            token_hash=sha256_hex(refresh_token),
+            expires_at=exp,
+            ip=ip,
+            user_agent=user_agent,
+        )
+    )
+    db.commit()
+
+    # 4) 쿠키 세팅
+    set_refresh_cookie(response, refresh_token)
+
+    return {
+        "token_type": "bearer",
+        "access_token": access_token,
+        "expires_in": 60 * int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "120")),
+        "user_id": str(user.user_id),
+    }
+
+
+@auth_router.post("/refresh")
+def refresh_token_endpoint(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_session),
+):
+    """
+    RT 회전:
+    1) 쿠키(권장) 또는 바디에서 RT 추출
+    2) 서명/만료 검증 → jti/sub 얻기
+    3) DB에서 jti 조회 → 이미 무효(revoked/replaced)면 재사용 탐지 → 보안 이벤트 처리
+    4) 새 AT/RT 발급, 이전 RT 무효화(replaced_by, revoked_at)
+    """
+    # 1) 토큰 추출(쿠키 우선)
+    rt = request.cookies.get(REFRESH_COOKIE_NAME)
+    if not rt:
+        # 바디로 보내는 클라이언트도 있을 수 있으니 옵션으로 허용
+        body = None
+        try:
+            body = request.json()
+        except Exception:
+            pass
+        if isinstance(body, dict):
+            rt = body.get("refresh_token")
+    if not rt:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token missing")
+
+    # 2) 서명/만료 검증
+    try:
+        payload = verify_refresh_token(rt)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+
+    sub = payload.get("sub")
+    jti = payload.get("jti")
+    if not sub or not jti:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token payload")
+
+    # 3) DB 조회
+    rt_row = db.get(RefreshToken, jti)
+    if rt_row is None:
+        # DB에 기록이 없으면 이미 폐기됐거나 재사용 탐지 케이스 가능
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token not recognized")
+
+    # 재사용 탐지: 이미 교체되었거나(replaced_by) 또는 revoked
+    if rt_row.revoked_at is not None or rt_row.replaced_by is not None:
+        # 간단 대응: 해당 사용자 RT 전부 무효화
+        db.exec(
+            select(RefreshToken).where(
+                RefreshToken.user_id == rt_row.user_id,
+                RefreshToken.revoked_at.is_(None),
+            )
+        )
+        for row in db.exec(
+            select(RefreshToken).where(RefreshToken.user_id == rt_row.user_id)
+        ):
+            if row.revoked_at is None:
+                row.revoked_at = datetime.utcnow()
+        db.commit()
+        clear_refresh_cookie(response)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token reused")
+
+    # 토큰 원문 해시 일치 확인(유출/조작 방지)
+    if rt_row.token_hash != sha256_hex(rt):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token tampered")
+
+    # 4) 새 AT/RT 발급(회전)
+    user = db.get(User, UUID(sub))
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    # 새 토큰들
+    new_access = create_access_token(user.user_id)
+    new_jti = new_refresh_jti()
+    new_rt, new_exp = create_refresh_token(user.user_id, new_jti)
+
+    # 이전 RT 무효화 + 체인 연결
+    rt_row.revoked_at = datetime.utcnow()
+    rt_row.replaced_by = new_jti
+
+    # 새 RT 저장
+    db.add(
+        RefreshToken(
+            jti=new_jti,
+            user_id=user.user_id,
+            token_hash=sha256_hex(new_rt),
+            expires_at=new_exp,
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+    )
+    db.commit()
+
+    # 쿠키 교체
+    set_refresh_cookie(response, new_rt)
+
+    return {
+        "token_type": "bearer",
+        "access_token": new_access,
+        "expires_in": 60 * int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "120")),
+        "user_id": str(user.user_id),
+    }
+
+
+@auth_router.post("/logout")
+def logout_endpoint(
+    response: Response,
+    db: Session = Depends(get_session),
+    # 현재 프로젝트에서 인증 유저를 얻는 의존성(dependency)이 있다면 바꿔 사용
+    current_user: User = Depends(...),  # 예: Depends(get_current_user)
+):
+    """
+    현재 사용자 모든 RT 무효화 + 쿠키 제거
+    """
+    if not current_user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+    for row in db.exec(
+        select(RefreshToken).where(
+            RefreshToken.user_id == current_user.user_id,
+            RefreshToken.revoked_at.is_(None),
+        )
+    ):
+        row.revoked_at = datetime.utcnow()
+    db.commit()
+
+    clear_refresh_cookie(response)
+    return {"ok": True}

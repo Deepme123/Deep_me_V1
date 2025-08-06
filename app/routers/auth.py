@@ -4,7 +4,6 @@ import os
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
-from app.core.jwt import create_access_token
 from urllib.parse import urlencode
 
 import httpx

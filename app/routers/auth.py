@@ -132,3 +132,92 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
 
     access_token = create_access_token(user["user_id"])
     return {"access_token": access_token, "token_type": "bearer"}
+
+# ---- (추가) 요청/응답 모델 & JWT 헬퍼 ----
+from pydantic import BaseModel
+
+class GoogleIdTokenReq(BaseModel):
+    id_token: str
+
+class AuthTokenModel(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user: dict
+
+def _issue_jwt(user):
+    # 서버 자체 JWT 발급 (1시간 유효)
+    return create_access_token(str(user.user_id), expires_delta=timedelta(hours=1))
+
+
+# ---- (추가) POST /auth/google : id_token 기반 인증 ----
+@auth_router.post("/auth/google", response_model=AuthTokenModel, tags=["auth"])
+async def auth_with_google(body: GoogleIdTokenReq, db: Session = Depends(get_session)):
+    # 간편 검증(tokeninfo); 운영에선 google-auth 라이브러리로 서명 검증 권장
+    async with httpx.AsyncClient() as client:
+        r = await client.get("https://oauth2.googleapis.com/tokeninfo", params={"id_token": body.id_token})
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail="유효하지 않은 id_token")
+    data = r.json()
+
+    # 필수 클레임 검사
+    if data.get("aud") != GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=400, detail="aud 불일치")
+    if data.get("iss") not in {"accounts.google.com", "https://accounts.google.com"}:
+        raise HTTPException(status_code=400, detail="iss 불일치")
+
+    email = data.get("email")
+    name = data.get("name") or data.get("given_name") or (email.split("@")[0] if email else None)
+    if not email:
+        raise HTTPException(status_code=400, detail="email 없음")
+
+    # 사용자 upsert
+    user = db.exec(select(User).where(User.email == email)).first()
+    if not user:
+        user = User(name=name or "User", email=email)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    jwt_ = _issue_jwt(user)
+    return {
+        "access_token": jwt_,
+        "token_type": "bearer",
+        "expires_in": 3600,
+        "user": {"user_id": str(user.user_id), "name": user.name, "email": user.email},
+    }
+
+
+# ---- (선택 추가) POST /auth/google/access : access_token 기반 인증 ----
+# FE가 access_token만 전달하겠다고 하면 아래 엔드포인트도 함께 사용 가능
+class GoogleAccessTokenReq(BaseModel):
+    access_token: str
+
+@auth_router.post("/auth/google/access", response_model=AuthTokenModel, tags=["auth"])
+async def auth_with_google_access(body: GoogleAccessTokenReq, db: Session = Depends(get_session)):
+    headers = {"Authorization": f"Bearer {body.access_token}"}
+    async with httpx.AsyncClient() as client:
+        r = await client.get("https://www.googleapis.com/oauth2/v3/userinfo", headers=headers)
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail="access_token으로 userinfo 조회 실패")
+    u = r.json()
+
+    email = u.get("email")
+    name = u.get("name") or u.get("given_name") or (email.split("@")[0] if email else None)
+    if not email:
+        raise HTTPException(status_code=400, detail="email 정보가 없습니다 (scope: openid email profile 필요)")
+
+    user = db.exec(select(User).where(User.email == email)).first()
+    if not user:
+        user = User(name=name or "User", email=email)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    jwt_ = _issue_jwt(user)
+    return {
+        "access_token": jwt_,
+        "token_type": "bearer",
+        "expires_in": 3600,
+        "user": {"user_id": str(user.user_id), "name": user.name, "email": user.email},
+    }

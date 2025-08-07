@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import os
 import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Tuple
 from uuid import UUID, uuid4
+from jose import jwt, JWTError
+import os
 
-from jose import jwt  # ← python-jose 사용
+# ← python-jose 사용
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -114,3 +115,10 @@ def clear_refresh_cookie(response):
         key=REFRESH_COOKIE_NAME,
         path="/",
     )
+
+def decode_access_token(token: str):
+    """verify_access_token 과 동일 기능. 기존 코드 호환용."""
+    try:
+        return verify_access_token(token)
+    except JWTError:
+        return None

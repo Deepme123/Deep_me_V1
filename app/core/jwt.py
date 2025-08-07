@@ -4,7 +4,7 @@ from jose import jwt, JWTError
 from datetime import datetime, timedelta
 import os
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "deepme-secret-key")
+SECRET_KEY = settings.JWT_SECRET_KEY 
 ALGORITHM = "HS256"
 EXPIRE_MINUTES = 60  # 1시간
 

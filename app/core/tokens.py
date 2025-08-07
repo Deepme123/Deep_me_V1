@@ -19,7 +19,7 @@ def _env_bool(key: str, default: bool) -> bool:
 # ---- 설정 ----
 ALG = os.getenv("JWT_ALGORITHM", "HS256")
 
-ACCESS_SECRET = os.getenv("JWT_SECRET", "dev_access_secret_change_me")
+ACCESS_SECRET = os.getenv("JWT_SECRET_KEY", "deepme-secret-key")
 ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "120"))
 
 REFRESH_SECRET = os.getenv("JWT_REFRESH_SECRET", "dev_refresh_secret_change_me")

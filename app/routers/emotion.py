@@ -13,7 +13,7 @@ from app.schemas.emotion import (
 )
 from app.services.llm_service import generate_noa_response
 from app.core.prompt_loader import get_system_prompt, get_task_prompt
-from app.services.convo_policy import should_inject_activity, mark_activity_injected
+from app.services.convo_policy import is_activity_turn, is_closing_turn, mark_activity_injected
 
 router = APIRouter(prefix="/emotion", tags=["Emotion"])
 
@@ -99,7 +99,7 @@ def generate_emotion_step(
     system_prompt = get_system_prompt()
 
     # 활동과제 프롬프트 조건부 주입(8~10턴 구간 1회)
-    inject = should_inject_activity(input_data.session_id, db)
+    inject = is_activity_turn(input_data.session_id, db)
     if inject:
         mark_activity_injected(input_data.session_id, db)
 

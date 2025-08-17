@@ -1,6 +1,6 @@
 # app/routers/emotion_ws.py
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from sqlmodel import select, func
+from sqlmodel import select
 from uuid import UUID
 from datetime import datetime
 import asyncio
@@ -15,7 +15,7 @@ from app.services.llm_service import stream_noa_response
 from app.services.task_recommend import recommend_tasks_from_session_core
 from app.core.jwt import decode_access_token  # JWT 디코드 함수
 from app.core.prompt_loader import get_system_prompt, get_task_prompt
-from app.services.convo_policy import should_inject_activity, mark_activity_injected
+from app.services.convo_policy import should_inject_activity, mark_activity_injected, _turn_count
 
 # 종료 설정 상수
 SESSION_MAX_TURNS = int(os.getenv("SESSION_MAX_TURNS", "20"))
@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 def _should_recommend_tasks(user_text: str, sess: EmotionSession) -> bool:
-    """간단 트리거: 키워드 기반 과제 추천 조건."""
     if not user_text:
         return False
     kw = ("과제", "활동", "뭐 해볼까", "추천해줘", "해볼만한", "미션")
@@ -36,7 +35,6 @@ def _should_recommend_tasks(user_text: str, sess: EmotionSession) -> bool:
 
 
 def _format_tasks_as_chat(tasks: list[Task]) -> str:
-    """과제 추천을 자연스러운 챗 텍스트로 변환."""
     lines = ["", "📝 활동과제 추천"]
     for i, t in enumerate(tasks, 1):
         desc = f"\n   - {getattr(t, 'description', '')}" if getattr(t, "description", None) else ""
@@ -46,7 +44,6 @@ def _format_tasks_as_chat(tasks: list[Task]) -> str:
 
 
 async def _agen(gen):
-    """sync/async 제너레이터 모두 호환."""
     if inspect.isasyncgen(gen):
         async for x in gen:
             yield x
@@ -57,14 +54,12 @@ async def _agen(gen):
 
 @ws_router.websocket("/ws/emotion")
 async def emotion_chat(websocket: WebSocket):
-    # ── 0) 핸드셰이크 직전 로깅(인증 전달 여부만) ──
     has_auth_header = bool(websocket.headers.get("authorization"))
     logger.info("WS handshake(app-mode): auth_header=%s url=%s", has_auth_header, websocket.url)
 
-    # ── 1) 업그레이드 ──
     await websocket.accept()
 
-    # ── 2) 인증 처리 ──
+    # 인증
     token = None
     auth = websocket.headers.get("authorization")
     if auth and auth.lower().startswith("bearer "):
@@ -77,13 +72,13 @@ async def emotion_chat(websocket: WebSocket):
 
     try:
         payload = decode_access_token(token)
-        user_id = UUID(payload["sub"])  # 신뢰 원천은 토큰의 sub
+        user_id = UUID(payload["sub"])
     except Exception:
         await websocket.send_json({"error": "invalid_token"})
         await websocket.close(code=4401)
         return
 
-    # (선택) 쿼리 user_id와 토큰 일치 확인
+    # user_id 일치 검사(옵션)
     qp = websocket.query_params
     qp_user_id = qp.get("user_id")
     if qp_user_id and qp_user_id != str(user_id):
@@ -109,29 +104,26 @@ async def emotion_chat(websocket: WebSocket):
             db.commit()
             db.refresh(sess)
 
-        # 세션ID 프런트로 전달
         await websocket.send_json({"session_id": str(sess.session_id)})
 
         while True:
             try:
-                # (1) 입력 수신 + 타임아웃
+                # 입력 + 타임아웃
                 try:
                     req = await asyncio.wait_for(websocket.receive_json(), timeout=WS_IDLE_TIMEOUT_SECS)
                 except asyncio.TimeoutError:
-                    # 유휴 종료
                     sess.ended_at = datetime.utcnow()
                     db.add(sess); db.commit()
                     await websocket.send_json({"info": "idle_timeout", "session_closed": True})
-                    await websocket.close(code=1001)  # going away
+                    await websocket.close(code=1001)
                     break
 
                 user_input = (req.get("user_input") or "").strip()
                 if req.get("close") is True or user_input in CLOSE_TOKENS:
-                    # 명시 종료
                     sess.ended_at = datetime.utcnow()
                     db.add(sess); db.commit()
                     await websocket.send_json({"info": "client_close", "session_closed": True})
-                    await websocket.close(code=1000)  # normal
+                    await websocket.close(code=1000)
                     break
 
                 if not user_input:
@@ -141,20 +133,19 @@ async def emotion_chat(websocket: WebSocket):
                 step_type = req.get("step_type", "normal")
                 system_prompt = req.get("system_prompt") or get_system_prompt()
 
-                # (2) 활동과제 프롬프트 조건부 주입
+                # 활동과제 프롬프트 조건부 주입
                 inject = should_inject_activity(sess.session_id, db)
                 if inject:
                     system_prompt = f"{system_prompt}\n\n{get_task_prompt()}"
 
-                # 최근 스텝 조회
+                # 최근 스텝
                 recent = db.exec(
                     select(EmotionStep)
                     .where(EmotionStep.session_id == sess.session_id)
                     .order_by(EmotionStep.step_order)
                 ).all()
-                logger.debug("Recent steps: %d", len(recent))
 
-                # ── 1) LLM 스트리밍 ──
+                # 스트리밍
                 collected_tokens = []
                 async for token_piece in _agen(
                     stream_noa_response(
@@ -168,7 +159,7 @@ async def emotion_chat(websocket: WebSocket):
                         collected_tokens.append(token_piece)
                         await websocket.send_json({"token": token_piece})
 
-                # ── 2) 활동과제 자동 추천 트리거 ──
+                # 과제 추천(키워드)
                 try:
                     if _should_recommend_tasks(user_input, sess):
                         await asyncio.sleep(2)
@@ -186,11 +177,11 @@ async def emotion_chat(websocket: WebSocket):
                 except Exception:
                     logger.exception("task recommendation failed")
 
-                # ── 3) 저장 ──
+                # 저장
                 full_text = "".join(collected_tokens)
                 new_step = EmotionStep(
                     session_id=sess.session_id,
-                    step_order=len(recent) + 1,
+                    step_order=(recent[-1].step_order + 1) if recent else 1,
                     step_type=step_type,
                     user_input=user_input,
                     gpt_response=full_text,
@@ -200,22 +191,18 @@ async def emotion_chat(websocket: WebSocket):
                 db.commit()
                 db.refresh(new_step)
 
-                # (3) 활동과제 주입 마킹
+                # 주입 마킹
                 if inject:
                     mark_activity_injected(sess.session_id, db)
+                    if AUTO_END_AFTER_ACTIVITY:
+                        sess.ended_at = datetime.utcnow()
+                        db.add(sess); db.commit()
+                        await websocket.send_json({"info": "activity_reached", "session_closed": True})
+                        await websocket.close(code=1000)
+                        break
 
-                # (4) 선택: 활동과제 주입 턴에서 자동 종료
-                if inject and AUTO_END_AFTER_ACTIVITY:
-                    sess.ended_at = datetime.utcnow()
-                    db.add(sess); db.commit()
-                    await websocket.send_json({"info": "activity_reached", "session_closed": True})
-                    await websocket.close(code=1000)
-                    break
-
-                # (5) 최대 턴 초과 시 종료
-                turns = db.exec(
-                    select(func.count(EmotionStep.step_id)).where(EmotionStep.session_id == sess.session_id)
-                ).one()
+                # 최대 턴 종료(대화 턴 기준)
+                turns = _turn_count(db, sess.session_id)
                 if int(turns) >= SESSION_MAX_TURNS:
                     sess.ended_at = datetime.utcnow()
                     db.add(sess); db.commit()
@@ -223,7 +210,7 @@ async def emotion_chat(websocket: WebSocket):
                     await websocket.close(code=1000)
                     break
 
-                # ── 4) 완료 신호 ──
+                # 완료 신호
                 await websocket.send_json({
                     "done": True,
                     "step_id": str(new_step.step_id),

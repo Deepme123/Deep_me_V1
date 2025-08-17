@@ -99,9 +99,9 @@ def generate_emotion_step(
     system_prompt = get_system_prompt()
 
     # 활동과제 프롬프트 조건부 주입(8~10턴 구간 1회)
-    inject = should_inject_activity(input_data.session_id)
+    inject = should_inject_activity(input_data.session_id, db)
     if inject:
-        system_prompt = f"{system_prompt}\n\n{get_task_prompt()}"
+        mark_activity_injected(input_data.session_id, db)
 
     # LLM 응답 생성
     response = generate_noa_response(input_data, system_prompt=system_prompt)

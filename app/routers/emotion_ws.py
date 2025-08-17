@@ -122,9 +122,9 @@ async def emotion_chat(websocket: WebSocket):
                 system_prompt = req.get("system_prompt") or get_system_prompt()
 
                 # ── 활동과제 프롬프트 조건부 주입 ──
-                inject = should_inject_activity(sess.session_id)
+                inject = should_inject_activity(sess.session_id, db)
                 if inject:
-                    system_prompt = f"{system_prompt}\n\n{get_task_prompt()}"
+                    mark_activity_injected(sess.session_id, db)
 
                 # 최근 스텝 조회
                 recent = db.exec(

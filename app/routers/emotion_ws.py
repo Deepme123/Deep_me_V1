@@ -13,11 +13,13 @@ from app.models.emotion import EmotionSession, EmotionStep
 from app.models.task import Task  # (타입 힌트/포맷용)
 from app.services.llm_service import stream_noa_response
 from app.services.task_recommend import recommend_tasks_from_session_core
-from app.core.jwt import decode_access_token  # JWT 디코드 함수
+from app.core.jwt import decode_access_token
 from app.core.prompt_loader import get_system_prompt, get_task_prompt
-from app.services.convo_policy import should_inject_activity, mark_activity_injected, _turn_count
+from app.services.convo_policy import (
+    is_activity_turn, is_closing_turn, mark_activity_injected, _turn_count
+)
 
-# 종료 설정 상수
+# 종료·행동 설정
 SESSION_MAX_TURNS = int(os.getenv("SESSION_MAX_TURNS", "20"))
 WS_IDLE_TIMEOUT_SECS = int(os.getenv("WS_IDLE_TIMEOUT_SECS", "180"))
 AUTO_END_AFTER_ACTIVITY = os.getenv("AUTO_END_AFTER_ACTIVITY", "0") == "1"
@@ -54,8 +56,8 @@ async def _agen(gen):
 
 @ws_router.websocket("/ws/emotion")
 async def emotion_chat(websocket: WebSocket):
-    has_auth_header = bool(websocket.headers.get("authorization"))
-    logger.info("WS handshake(app-mode): auth_header=%s url=%s", has_auth_header, websocket.url)
+    logger.info("WS handshake(app-mode): auth_header=%s url=%s",
+                bool(websocket.headers.get("authorization")), websocket.url)
 
     await websocket.accept()
 
@@ -64,12 +66,10 @@ async def emotion_chat(websocket: WebSocket):
     auth = websocket.headers.get("authorization")
     if auth and auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
-
     if not token:
         await websocket.send_json({"error": "unauthorized", "reason": "missing_authorization_header"})
         await websocket.close(code=4401)
         return
-
     try:
         payload = decode_access_token(token)
         user_id = UUID(payload["sub"])
@@ -125,18 +125,28 @@ async def emotion_chat(websocket: WebSocket):
                     await websocket.send_json({"info": "client_close", "session_closed": True})
                     await websocket.close(code=1000)
                     break
-
                 if not user_input:
                     await websocket.send_json({"error": "empty_input"})
                     continue
 
                 step_type = req.get("step_type", "normal")
-                system_prompt = req.get("system_prompt") or get_system_prompt()
 
-                # 활동과제 프롬프트 조건부 주입
-                inject = should_inject_activity(sess.session_id, db)
-                if inject:
+                # 이번 턴 성격 결정
+                activity_turn = is_activity_turn(sess.session_id, db)
+                closing_turn = is_closing_turn(sess.session_id, db)
+
+                # 시스템 프롬프트는 서버가 조립
+                system_prompt = get_system_prompt()
+                if activity_turn:
                     system_prompt = f"{system_prompt}\n\n{get_task_prompt()}"
+                if closing_turn:
+                    system_prompt = f"""{system_prompt}
+
+[대화 마무리 지침]
+- 핵심 요약 2줄
+- 오늘 배운 1가지만 강조
+- 간단한 끝인사 1줄
+"""
 
                 # 최근 스텝
                 recent = db.exec(
@@ -191,8 +201,15 @@ async def emotion_chat(websocket: WebSocket):
                 db.commit()
                 db.refresh(new_step)
 
-                # 주입 마킹
-                if inject:
+                # 완료 신호
+                await websocket.send_json({
+                    "done": True,
+                    "step_id": str(new_step.step_id),
+                    "created_at": new_step.created_at.isoformat(),
+                })
+
+                # 활동과제 마킹 및 선택적 즉시 종료
+                if activity_turn:
                     mark_activity_injected(sess.session_id, db)
                     if AUTO_END_AFTER_ACTIVITY:
                         sess.ended_at = datetime.utcnow()
@@ -201,21 +218,22 @@ async def emotion_chat(websocket: WebSocket):
                         await websocket.close(code=1000)
                         break
 
-                # 최대 턴 종료(대화 턴 기준)
-                turns = _turn_count(db, sess.session_id)
-                if int(turns) >= SESSION_MAX_TURNS:
+                # 종료 판단
+                turns = _turn_count(db, sess.session_id)  # 대화 턴 기준
+                if closing_turn:
                     sess.ended_at = datetime.utcnow()
                     db.add(sess); db.commit()
-                    await websocket.send_json({"info": "max_turns", "session_closed": True})
+                    await websocket.send_json({"info": "session_closed", "turns": turns})
                     await websocket.close(code=1000)
                     break
-
-                # 완료 신호
-                await websocket.send_json({
-                    "done": True,
-                    "step_id": str(new_step.step_id),
-                    "created_at": new_step.created_at.isoformat(),
-                })
+                if int(turns) > SESSION_MAX_TURNS:
+                    logger.warning("turn overflow: %s", turns)
+                if int(turns) >= SESSION_MAX_TURNS and not closing_turn:
+                    sess.ended_at = datetime.utcnow()
+                    db.add(sess); db.commit()
+                    await websocket.send_json({"info": "max_turns_guard_close", "session_closed": True})
+                    await websocket.close(code=1000)
+                    break
 
             except WebSocketDisconnect:
                 logger.info("WS disconnected user_id=%s", user_id)

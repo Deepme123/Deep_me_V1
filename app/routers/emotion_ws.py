@@ -22,10 +22,11 @@ from app.services.convo_policy import (
     _turn_count,
 )
 
-# 종료·행동 설정
+# 설정
 SESSION_MAX_TURNS = int(os.getenv("SESSION_MAX_TURNS", "20"))
 WS_IDLE_TIMEOUT_SECS = int(os.getenv("WS_IDLE_TIMEOUT_SECS", "180"))
 AUTO_END_AFTER_ACTIVITY = os.getenv("AUTO_END_AFTER_ACTIVITY", "0") == "1"
+HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "8"))  # 최근 N 스텝만 전달
 CLOSE_TOKENS = {"그만", "끝", "종료", "bye", "quit", "exit"}
 
 ws_router = APIRouter()
@@ -157,14 +158,15 @@ async def emotion_chat(websocket: WebSocket):
 - 간단한 끝인사 1줄
 """
 
-                # 최근 스텝
-                recent = db.exec(
+                # 최근 스텝 (역할 보존 전달)
+                recent_all = db.exec(
                     select(EmotionStep)
                     .where(EmotionStep.session_id == sess.session_id)
                     .order_by(EmotionStep.step_order)
                 ).all()
+                recent = recent_all[-HISTORY_TURNS:] if HISTORY_TURNS > 0 else recent_all
 
-                # 스트리밍
+                # 스트리밍 호출
                 collected_tokens = []
                 async for token_piece in _agen(
                     stream_noa_response(
@@ -178,7 +180,7 @@ async def emotion_chat(websocket: WebSocket):
                         collected_tokens.append(token_piece)
                         await websocket.send_json({"token": token_piece})
 
-                # 과제 추천(키워드) — 마무리 턴에는 비활성화
+                # 과제 추천(마무리 턴에는 비활성화)
                 try:
                     if not closing_turn and _should_recommend_tasks(user_input, sess):
                         await asyncio.sleep(2)
@@ -200,7 +202,7 @@ async def emotion_chat(websocket: WebSocket):
                 full_text = "".join(collected_tokens)
                 new_step = EmotionStep(
                     session_id=sess.session_id,
-                    step_order=(recent[-1].step_order + 1) if recent else 1,
+                    step_order=(recent_all[-1].step_order + 1) if recent_all else 1,
                     step_type=step_type,
                     user_input=user_input,
                     gpt_response=full_text,

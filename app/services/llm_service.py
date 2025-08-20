@@ -37,116 +37,84 @@ def _condense_history(history: list[str], max_chars: int = 1000) -> str:
     return "...\n" + combined[-max_chars:]
 
 
+# app/services/llm_service.py
+from typing import List, Dict, Optional
+from app.core.prompt_loader import get_system_prompt
+
+MAX_TURNS = 8  # user/assistant 쌍 기준 최근 N턴만 유지
+
 def _build_messages(
     user_input: str,
-    emotion_label: Optional[str],
-    topic: Optional[str],
-    history_snippet: str,
+    recent_steps: list,
     system_prompt: Optional[str] = None,
-) -> List[dict]:
-    """
-    LLM에 전달할 메시지 배열 구성.
-    ※ 보안: 이 함수 내부에서 메시지를 로그로 남기지 않음.
-    """
-    sys = system_prompt or get_system_prompt()
+    meta: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    sys_txt = system_prompt or get_system_prompt()
+    messages: List[Dict[str, str]] = [{"role": "system", "content": sys_txt}]
+    if meta:
+        messages.append({"role": "user", "content": meta})
 
-    ctx_parts: list[str] = []
-    if emotion_label:
-        ctx_parts.append(f"감정: {emotion_label}")
-    if topic:
-        ctx_parts.append(f"주제: {topic}")
-    if history_snippet:
-        ctx_parts.append(f"최근 대화:\n{history_snippet}")
+    # ✅ 역할 보존. 문자열 합치기 금지. 과거 assistant를 user로 넣지 말 것.
+    kept = recent_steps[-MAX_TURNS:] if MAX_TURNS else recent_steps
+    for s in kept:
+        if getattr(s, "user_input", None):
+            messages.append({"role": "user", "content": s.user_input})
+        if getattr(s, "gpt_response", None):
+            messages.append({"role": "assistant", "content": s.gpt_response})
 
-    messages: List[dict] = [{"role": "system", "content": sys}]
-    if ctx_parts:
-        messages.append({"role": "user", "content": "\n".join(ctx_parts)})
+    # 최종 입력
     messages.append({"role": "user", "content": user_input})
     return messages
 
+def _debug_log_messages(messages: List[Dict[str, str]], logger):
+    # 첫 메시지가 system인지, ‘GPT:’ 같은 프리픽스가 user에 섞였는지 점검
+    try:
+        logger.debug("first_role=%s total=%d", messages[0]["role"], len(messages))
+        for i, m in enumerate(messages[:6]):  # 앞부분만
+            logger.debug("m[%d].role=%s len=%d", i, m["role"], len(m["content"]))
+    except Exception:
+        pass
 
-def generate_noa_response(
-    user_input: str,
-    session: EmotionSession,
-    recent_steps: List[EmotionStep],
-    temperature: Optional[float] = None,
-    max_tokens: Optional[int] = None,
-    system_prompt: Optional[str] = None,
-) -> str:
-    """
-    단건 응답 생성 (스트리밍 아님).
-    예외 발생 시 외부로 상세 노출 금지 → 빈 문자열 반환 또는 상위에서 처리.
-    """
+
+
+# app/services/llm_service.py
+def generate_noa_response(input_data, system_prompt=None):
+    messages = _build_messages(
+        user_input=input_data.user_input,
+        recent_steps=input_data.recent_steps,  # 라우터에서 조회해 전달
+        system_prompt=system_prompt,
+        meta=None,
+    )
+    _debug_log_messages(messages, logger)
+
+    resp = client.chat.completions.create(
+        model=MODEL, messages=messages,
+        temperature=temperature or TEMPERATURE,
+        max_tokens=max_tokens or MAX_TOKENS,
+        top_p=TOP_P,
+        presence_penalty=PRESENCE_PENALTY,
+        frequency_penalty=FREQUENCY_PENALTY,
+    )
+    return resp.choices[0].message.content
+
+
+
+# app/services/llm_service.py
+async def stream_noa_response(user_input, session, recent_steps, system_prompt=None):
     messages = _build_messages(
         user_input=user_input,
-        emotion_label=session.emotion_label,
-        topic=session.topic,
-        history_snippet=_condense_history([
-            f"유저: {s.user_input}\nGPT: {s.gpt_response}" for s in recent_steps
-        ]),
+        recent_steps=recent_steps,
         system_prompt=system_prompt,
+        meta=None,
     )
+    _debug_log_messages(messages, logger)
 
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            temperature=temperature if temperature is not None else TEMPERATURE,
-            max_tokens=max_tokens if max_tokens is not None else MAX_TOKENS,
-            top_p=TOP_P,
-            presence_penalty=PRESENCE_PENALTY,
-            frequency_penalty=FREQUENCY_PENALTY,
-        )
-        content = (resp.choices[0].message.content or "").strip()
-        return content
-    except Exception:
-        # 내부에만 상세 기록 (프롬프트/유저입력 등 민감데이터는 남기지 않음)
-        logger.exception("LLM completion failed")
-        return ""  # 호출 측에서 빈 응답 처리(재시도/에러 안내 등)
-
-
-def stream_noa_response(
-    *,
-    user_input: str,
-    session: EmotionSession,
-    recent_steps: List[EmotionStep],
-    system_prompt: Optional[str] = None,
-    temperature: float = TEMPERATURE,
-    max_tokens: int = 400,
-) -> Generator[str, None, None]:
-    """
-    토큰 단위 스트리밍 응답 생성.
-    예외 발생 시 외부로 상세 노출 금지.
-    """
-    messages = _build_messages(
-        user_input=user_input,
-        emotion_label=session.emotion_label,
-        topic=session.topic,
-        history_snippet=_condense_history([
-            f"유저: {s.user_input}\nGPT: {s.gpt_response}" for s in recent_steps
-        ]),
-        system_prompt=system_prompt,
+    stream = client.chat.completions.create(
+        model=MODEL, messages=messages, stream=True,
+        temperature=TEMPERATURE, max_tokens=MAX_TOKENS,
+        top_p=TOP_P, presence_penalty=PRESENCE_PENALTY, frequency_penalty=FREQUENCY_PENALTY,
     )
-
-    try:
-        stream = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-            top_p=TOP_P,
-            presence_penalty=PRESENCE_PENALTY,
-            frequency_penalty=FREQUENCY_PENALTY,
-        )
-        for chunk in stream:
-            try:
-                delta = chunk.choices[0].delta.content or ""
-            except Exception:
-                delta = ""
-            if delta:
-                yield delta
-    except Exception:
-        # 스트리밍 실패 → 외부로는 상세 미노출
-        logger.exception("LLM streaming failed")
-        return  # 조용히 종료 (상위 WS에서 에러 메시지를 일반화해 전송)
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content or ""
+        if delta:
+            yield delta

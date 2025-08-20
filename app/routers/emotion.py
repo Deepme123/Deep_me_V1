@@ -121,13 +121,25 @@ def generate_emotion_step(
 - 간단한 끝인사 1줄
 """
 
-    # LLM 응답 생성
-    response = generate_noa_response(input_data, system_prompt=system_prompt)
+    # 최근 스텝 조회(역할 보존 전달)
+    recent_all = db.exec(
+        select(EmotionStep)
+        .where(EmotionStep.session_id == input_data.session_id)
+        .order_by(EmotionStep.step_order)
+    ).all()
 
-    # 스텝 저장
+    # LLM 응답 생성(최근 스텝을 llm_service로 전달)
+    response = generate_noa_response(
+        input_data=input_data,
+        system_prompt=system_prompt,
+        recent_steps=recent_all,  # llm_service에서 역할 보존 메시지로 빌드
+    )
+
+    # 스텝 저장(클라이언트 step_order 불신, 서버에서 다음 번호 부여)
+    next_order = (recent_all[-1].step_order + 1) if recent_all else 1
     new_step = EmotionStep(
         session_id=input_data.session_id,
-        step_order=input_data.step_order,
+        step_order=next_order,
         step_type="gpt_response",
         user_input=input_data.user_input,
         gpt_response=response,

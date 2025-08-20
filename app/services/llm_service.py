@@ -12,6 +12,9 @@ MODEL = os.getenv("LLM_MODEL", "gpt-3.5-turbo")
 TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))
 TIMEOUT = float(os.getenv("LLM_TIMEOUT_SEC", "30"))  # SDK에 따라 무시될 수 있음
+TOP_P = float(os.getenv("LLM_TOP_P", "1.0"))
+PRESENCE_PENALTY = float(os.getenv("LLM_PRESENCE_PENALTY", "0.3"))
+FREQUENCY_PENALTY = float(os.getenv("LLM_FREQUENCY_PENALTY", "0.6"))
 
 # OpenAI 클라이언트 (가능한 경우 timeout 옵션 사용)
 try:
@@ -90,6 +93,9 @@ def generate_noa_response(
             messages=messages,
             temperature=temperature if temperature is not None else TEMPERATURE,
             max_tokens=max_tokens if max_tokens is not None else MAX_TOKENS,
+            top_p=TOP_P,
+            presence_penalty=PRESENCE_PENALTY,
+            frequency_penalty=FREQUENCY_PENALTY,
         )
         content = (resp.choices[0].message.content or "").strip()
         return content
@@ -129,6 +135,9 @@ def stream_noa_response(
             temperature=temperature,
             max_tokens=max_tokens,
             stream=True,
+            top_p=TOP_P,
+            presence_penalty=PRESENCE_PENALTY,
+            frequency_penalty=FREQUENCY_PENALTY,
         )
         for chunk in stream:
             try:

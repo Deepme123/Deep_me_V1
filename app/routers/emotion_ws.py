@@ -16,7 +16,10 @@ from app.services.task_recommend import recommend_tasks_from_session_core
 from app.core.jwt import decode_access_token
 from app.core.prompt_loader import get_system_prompt, get_task_prompt
 from app.services.convo_policy import (
-    is_activity_turn, is_closing_turn, mark_activity_injected, _turn_count
+    is_activity_turn,
+    is_closing_turn,
+    mark_activity_injected,
+    _turn_count,
 )
 
 # 종료·행동 설정
@@ -56,9 +59,11 @@ async def _agen(gen):
 
 @ws_router.websocket("/ws/emotion")
 async def emotion_chat(websocket: WebSocket):
-    logger.info("WS handshake(app-mode): auth_header=%s url=%s",
-                bool(websocket.headers.get("authorization")), websocket.url)
-
+    logger.info(
+        "WS handshake(app-mode): auth_header=%s url=%s",
+        bool(websocket.headers.get("authorization")),
+        websocket.url,
+    )
     await websocket.accept()
 
     # 인증
@@ -113,7 +118,8 @@ async def emotion_chat(websocket: WebSocket):
                     req = await asyncio.wait_for(websocket.receive_json(), timeout=WS_IDLE_TIMEOUT_SECS)
                 except asyncio.TimeoutError:
                     sess.ended_at = datetime.utcnow()
-                    db.add(sess); db.commit()
+                    db.add(sess)
+                    db.commit()
                     await websocket.send_json({"info": "idle_timeout", "session_closed": True})
                     await websocket.close(code=1001)
                     break
@@ -121,7 +127,8 @@ async def emotion_chat(websocket: WebSocket):
                 user_input = (req.get("user_input") or "").strip()
                 if req.get("close") is True or user_input in CLOSE_TOKENS:
                     sess.ended_at = datetime.utcnow()
-                    db.add(sess); db.commit()
+                    db.add(sess)
+                    db.commit()
                     await websocket.send_json({"info": "client_close", "session_closed": True})
                     await websocket.close(code=1000)
                     break
@@ -135,16 +142,18 @@ async def emotion_chat(websocket: WebSocket):
                 activity_turn = is_activity_turn(sess.session_id, db)
                 closing_turn = is_closing_turn(sess.session_id, db)
 
-                # 시스템 프롬프트는 서버가 조립
+                # 시스템 프롬프트 조립
                 system_prompt = get_system_prompt()
                 if activity_turn:
                     system_prompt = f"{system_prompt}\n\n{get_task_prompt()}"
                 if closing_turn:
                     system_prompt = f"""{system_prompt}
 
-[대화 마무리 지침]
+[대화 마무리 지침](최우선)
+- 아래 지침은 다른 모든 규칙보다 우선한다.
+- 질문 금지. 요청하지 않은 과제 제안 금지. 이 메시지로 대화 종료.
 - 핵심 요약 2줄
-- 오늘 배운 1가지만 강조
+- 오늘 배운 1가지 강조
 - 간단한 끝인사 1줄
 """
 
@@ -169,9 +178,9 @@ async def emotion_chat(websocket: WebSocket):
                         collected_tokens.append(token_piece)
                         await websocket.send_json({"token": token_piece})
 
-                # 과제 추천(키워드)
+                # 과제 추천(키워드) — 마무리 턴에는 비활성화
                 try:
-                    if _should_recommend_tasks(user_input, sess):
+                    if not closing_turn and _should_recommend_tasks(user_input, sess):
                         await asyncio.sleep(2)
                         tasks = await asyncio.to_thread(
                             recommend_tasks_from_session_core,
@@ -202,27 +211,31 @@ async def emotion_chat(websocket: WebSocket):
                 db.refresh(new_step)
 
                 # 완료 신호
-                await websocket.send_json({
-                    "done": True,
-                    "step_id": str(new_step.step_id),
-                    "created_at": new_step.created_at.isoformat(),
-                })
+                await websocket.send_json(
+                    {
+                        "done": True,
+                        "step_id": str(new_step.step_id),
+                        "created_at": new_step.created_at.isoformat(),
+                    }
+                )
 
                 # 활동과제 마킹 및 선택적 즉시 종료
                 if activity_turn:
                     mark_activity_injected(sess.session_id, db)
                     if AUTO_END_AFTER_ACTIVITY:
                         sess.ended_at = datetime.utcnow()
-                        db.add(sess); db.commit()
+                        db.add(sess)
+                        db.commit()
                         await websocket.send_json({"info": "activity_reached", "session_closed": True})
                         await websocket.close(code=1000)
                         break
 
                 # 종료 판단
-                turns = _turn_count(db, sess.session_id)  # 대화 턴 기준
+                turns = _turn_count(db, sess.session_id)
                 if closing_turn:
                     sess.ended_at = datetime.utcnow()
-                    db.add(sess); db.commit()
+                    db.add(sess)
+                    db.commit()
                     await websocket.send_json({"info": "session_closed", "turns": turns})
                     await websocket.close(code=1000)
                     break
@@ -230,7 +243,8 @@ async def emotion_chat(websocket: WebSocket):
                     logger.warning("turn overflow: %s", turns)
                 if int(turns) >= SESSION_MAX_TURNS and not closing_turn:
                     sess.ended_at = datetime.utcnow()
-                    db.add(sess); db.commit()
+                    db.add(sess)
+                    db.commit()
                     await websocket.send_json({"info": "max_turns_guard_close", "session_closed": True})
                     await websocket.close(code=1000)
                     break

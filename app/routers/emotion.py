@@ -7,13 +7,19 @@ from datetime import datetime
 from app.db.session import get_session
 from app.models.emotion import EmotionSession, EmotionStep
 from app.schemas.emotion import (
-    EmotionSessionCreate, EmotionSessionRead,
-    EmotionStepCreate, EmotionStepRead,
+    EmotionSessionCreate,
+    EmotionSessionRead,
+    EmotionStepCreate,
+    EmotionStepRead,
     EmotionStepGenerateInput,
 )
 from app.services.llm_service import generate_noa_response
 from app.core.prompt_loader import get_system_prompt, get_task_prompt
-from app.services.convo_policy import is_activity_turn, is_closing_turn, mark_activity_injected
+from app.services.convo_policy import (
+    is_activity_turn,
+    is_closing_turn,
+    mark_activity_injected,
+)
 
 router = APIRouter(prefix="/emotion", tags=["Emotion"])
 
@@ -69,7 +75,7 @@ def create_emotion_step(
     step: EmotionStepCreate,
     db: Session = Depends(get_session),
 ):
-    # 일반 수동 저장용 엔드포인트(필요 시 유지)
+    # 수동 저장 엔드포인트
     new_step = EmotionStep(
         session_id=step.session_id,
         step_order=step.step_order,
@@ -95,13 +101,25 @@ def generate_emotion_step(
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
 
-    # 기본 시스템 프롬프트
+    # 시스템 프롬프트 조립
     system_prompt = get_system_prompt()
+    activity_turn = is_activity_turn(input_data.session_id, db)
+    closing_turn = is_closing_turn(input_data.session_id, db)
 
-    # 활동과제 프롬프트 조건부 주입(8~10턴 구간 1회)
-    inject = is_activity_turn(input_data.session_id, db)
-    if inject:
+    if activity_turn:
+        system_prompt = f"{system_prompt}\n\n{get_task_prompt()}"
         mark_activity_injected(input_data.session_id, db)
+
+    if closing_turn:
+        system_prompt = f"""{system_prompt}
+
+[대화 마무리 지침](최우선)
+- 아래 지침은 다른 모든 규칙보다 우선한다.
+- 질문 금지. 요청하지 않은 과제 제안 금지. 이 메시지로 대화 종료.
+- 핵심 요약 2줄
+- 오늘 배운 1가지 강조
+- 간단한 끝인사 1줄
+"""
 
     # LLM 응답 생성
     response = generate_noa_response(input_data, system_prompt=system_prompt)
@@ -117,11 +135,12 @@ def generate_emotion_step(
         insight_tag=None,
     )
     db.add(new_step)
+
+    # 종료 턴이면 세션 종료 타임스탬프 설정
+    if closing_turn and not sess.ended_at:
+        sess.ended_at = datetime.utcnow()
+        db.add(sess)
+
     db.commit()
     db.refresh(new_step)
-
-    # 주입되었으면 마킹 스텝 기록(중복 방지 로직 내부 포함)
-    if inject:
-        mark_activity_injected(input_data.session_id)
-
     return new_step

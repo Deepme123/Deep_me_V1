@@ -87,11 +87,15 @@ def generate_noa_response(input_data, system_prompt=None):
     )
     _debug_log_messages(messages, logger)
 
+# app/services/llm_service.py (비스트리밍 호출부가 있다면 동일 적용)
     resp = client.chat.completions.create(
-        model=MODEL, messages=messages,
-        temperature=TEMPERATURE, max_completion_tokens=MAX_TOKENS,
-        top_p=TOP_P, presence_penalty=PRESENCE_PENALTY, frequency_penalty=PENALTY,
-    )
+    model=MODEL,
+    messages=messages,
+    temperature=TEMPERATURE,
+    max_completion_tokens=MAX_TOKENS,
+    top_p=TOP_P,
+)
+
     return resp.choices[0].message.content
 
 
@@ -106,11 +110,16 @@ async def stream_noa_response(user_input, session, recent_steps, system_prompt=N
     )
     _debug_log_messages(messages, logger)
 
+# app/services/llm_service.py (스트리밍 호출부)
     stream = client.chat.completions.create(
-        model=MODEL, messages=messages, stream=True,
-        temperature=TEMPERATURE, max_completion_tokens=MAX_TOKENS,
-        top_p=TOP_P, presence_penalty=PRESENCE_PENALTY, frequency_penalty=FREQUENCY_PENALTY,
-    )
+    model=MODEL,
+    messages=messages,
+    stream=True,
+    temperature=TEMPERATURE,
+    max_completion_tokens=MAX_TOKENS,
+    top_p=TOP_P,
+)
+
     for chunk in stream:
         delta = chunk.choices[0].delta.content or ""
         if delta:

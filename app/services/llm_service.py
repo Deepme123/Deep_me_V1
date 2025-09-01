@@ -89,11 +89,8 @@ def generate_noa_response(input_data, system_prompt=None):
 
     resp = client.chat.completions.create(
         model=MODEL, messages=messages,
-        temperature=temperature or TEMPERATURE,
-        max_tokens=max_tokens or MAX_TOKENS,
-        top_p=TOP_P,
-        presence_penalty=PRESENCE_PENALTY,
-        frequency_penalty=FREQUENCY_PENALTY,
+        temperature=TEMPERATURE, max_completion_tokens=MAX_TOKENS,
+        top_p=TOP_P, presence_penalty=PRESENCE_PENALTY, frequency_penalty=PENALTY,
     )
     return resp.choices[0].message.content
 
@@ -111,7 +108,7 @@ async def stream_noa_response(user_input, session, recent_steps, system_prompt=N
 
     stream = client.chat.completions.create(
         model=MODEL, messages=messages, stream=True,
-        temperature=TEMPERATURE, max_tokens=MAX_TOKENS,
+        temperature=TEMPERATURE, max_completion_tokens=MAX_TOKENS,
         top_p=TOP_P, presence_penalty=PRESENCE_PENALTY, frequency_penalty=FREQUENCY_PENALTY,
     )
     for chunk in stream:

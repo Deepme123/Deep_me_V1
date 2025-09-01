@@ -1,4 +1,3 @@
-# app/routers/emotion_ws.py
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlmodel import select
 from uuid import UUID
@@ -7,6 +6,7 @@ import asyncio
 import logging
 import inspect
 import os
+from contextlib import suppress
 
 from app.db.session import get_session
 from app.models.emotion import EmotionSession, EmotionStep
@@ -27,6 +27,7 @@ SESSION_MAX_TURNS = int(os.getenv("SESSION_MAX_TURNS", "20"))
 WS_IDLE_TIMEOUT_SECS = int(os.getenv("WS_IDLE_TIMEOUT_SECS", "180"))
 AUTO_END_AFTER_ACTIVITY = os.getenv("AUTO_END_AFTER_ACTIVITY", "0") == "1"
 HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "8"))  # 최근 N 스텝만 전달
+# 닫기 토큰(영문은 소문자 기준)
 CLOSE_TOKENS = {"그만", "끝", "종료", "bye", "quit", "exit"}
 
 ws_router = APIRouter()
@@ -126,7 +127,8 @@ async def emotion_chat(websocket: WebSocket):
                     break
 
                 user_input = (req.get("user_input") or "").strip()
-                if req.get("close") is True or user_input in CLOSE_TOKENS:
+                user_input_norm = user_input.lower()
+                if req.get("close") is True or user_input_norm in CLOSE_TOKENS:
                     sess.ended_at = datetime.utcnow()
                     db.add(sess)
                     db.commit()
@@ -166,19 +168,25 @@ async def emotion_chat(websocket: WebSocket):
                 ).all()
                 recent = recent_all[-HISTORY_TURNS:] if HISTORY_TURNS > 0 else recent_all
 
-                # 스트리밍 호출
+                # 스트리밍 호출 (에러 가드 추가)
                 collected_tokens = []
-                async for token_piece in _agen(
-                    stream_noa_response(
-                        user_input=user_input,
-                        session=sess,
-                        recent_steps=recent,
-                        system_prompt=system_prompt,
-                    )
-                ):
-                    if token_piece:
-                        collected_tokens.append(token_piece)
-                        await websocket.send_json({"token": token_piece})
+                try:
+                    async for token_piece in _agen(
+                        stream_noa_response(
+                            user_input=user_input,
+                            session=sess,
+                            recent_steps=recent,
+                            system_prompt=system_prompt,
+                        )
+                    ):
+                        if token_piece:
+                            collected_tokens.append(token_piece)
+                            await websocket.send_json({"token": token_piece})
+                except Exception as e:
+                    logger.exception("LLM stream failed")
+                    with suppress(Exception):
+                        await websocket.send_json({"error": f"LLM 설정 오류: {e}"})
+                    continue
 
                 # 과제 추천(마무리 턴에는 비활성화)
                 try:
@@ -256,4 +264,6 @@ async def emotion_chat(websocket: WebSocket):
                 break
             except Exception:
                 logger.exception("WS error")
-                await websocket.send_json({"error": "internal_error"})
+                with suppress(Exception):
+                    await websocket.send_json({"error": "internal_error"})
+                break

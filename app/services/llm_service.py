@@ -13,8 +13,6 @@ TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))
 TIMEOUT = float(os.getenv("LLM_TIMEOUT_SEC", "30"))  # SDK에 따라 무시될 수 있음
 TOP_P = float(os.getenv("LLM_TOP_P", "1.0"))
-PRESENCE_PENALTY = float(os.getenv("LLM_PRESENCE_PENALTY", "0.3"))
-FREQUENCY_PENALTY = float(os.getenv("LLM_FREQUENCY_PENALTY", "0.6"))
 
 # OpenAI 클라이언트 (가능한 경우 timeout 옵션 사용)
 try:
@@ -124,3 +122,71 @@ async def stream_noa_response(user_input, session, recent_steps, system_prompt=N
         delta = chunk.choices[0].delta.content or ""
         if delta:
             yield delta
+
+# app/services/llm_service.py
+from openai import OpenAI, BadRequestError
+
+CHUNK_SIZE = 200  # 비스트리밍 폴백 시 클라이언트로 쪼개서 흘려보낼 크기
+
+def _chunk_text(s: str, n: int):
+    for i in range(0, len(s), n):
+        yield s[i:i+n]
+
+async def stream_noa_response(*, user_input, session, recent_steps, system_prompt):
+    """
+    스트리밍 우선. 400(unsupported_value: stream) 발생 시 비스트리밍으로 폴백.
+    """
+    client = OpenAI()
+
+    # 공용 메시지 구성
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+    # 최근 히스토리 -> (user, assistant) 순으로 복원
+    for step in recent_steps:
+        if step.user_input:
+            messages.append({"role": "user", "content": step.user_input})
+        if step.gpt_response:
+            messages.append({"role": "assistant", "content": step.gpt_response})
+    messages.append({"role": "user", "content": user_input})
+
+    # 1) 스트리밍 시도
+    try:
+        stream = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            stream=True,
+            temperature=TEMPERATURE,
+            max_completion_tokens=MAX_TOKENS,
+            top_p=TOP_P,
+        )
+        for event in stream:
+            # SDK에 따라 필드명이 delta/content로 들어옴
+            choice = getattr(event, "choices", [None])[0]
+            if not choice:
+                continue
+            delta = getattr(choice, "delta", None)
+            if delta and getattr(delta, "content", None):
+                yield delta.content
+        return
+
+    except BadRequestError as e:
+        # 조직 미인증으로 스트리밍 금지 케이스 → 비스트리밍 폴백
+        emsg = str(e)
+        if ("must be verified to stream this model" in emsg) or ("'param': 'stream'" in emsg and "'code': 'unsupported_value'" in emsg):
+            pass
+        else:
+            # 다른 400류는 상위에서 처리
+            raise
+
+    # 2) 비스트리밍 폴백
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=TEMPERATURE,
+        max_completion_tokens=MAX_TOKENS,
+        top_p=TOP_P,
+    )
+    text = resp.choices[0].message.content or ""
+    for piece in _chunk_text(text, CHUNK_SIZE):
+        yield piece

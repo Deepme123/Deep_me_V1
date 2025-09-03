@@ -180,9 +180,11 @@ async def emotion_chat(websocket: WebSocket):
                         )
                     ):
                         if token_piece:
+                            logger.debug("WS about to send token: %s", token_piece)
+                            await websocket.send_json({"token": token_piece})
+                            logger.debug("WS sent token successfully")
                             collected_tokens.append(token_piece)
                             first_token = True
-                            await websocket.send_json({"token": token_piece})
                 except Exception as e:
                     logger.exception("LLM stream failed")
                     with suppress(Exception):
@@ -273,4 +275,3 @@ async def emotion_chat(websocket: WebSocket):
                 with suppress(Exception):
                     await websocket.send_json({"error": "internal_error"})
                 break
-

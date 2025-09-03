@@ -92,11 +92,13 @@ async def stream_noa_response(*, user_input, session, recent_steps, system_promp
     client = OpenAI(timeout=TIMEOUT)
     messages = _build_messages(system_prompt=system_prompt, recent_steps=recent_steps, user_input=user_input)
 
-    # 1) 스트리밍 시도
     try:
         logger.info("LLM: streaming path selected (attempting stream=True)")
         stream = _safe_chat_create(client, model=MODEL, messages=messages, stream=True)
         for event in stream:
+            # 이벤트 원문 먼저 찍기 (모든 이벤트 추적)
+            logger.debug("stream event raw: %s", event)
+
             try:
                 choice = getattr(event, "choices", [None])[0]
                 if not choice:
@@ -115,7 +117,8 @@ async def stream_noa_response(*, user_input, session, recent_steps, system_promp
         else:
             raise
     except Exception:
-        logger.exception("LLM: streaming attempt failed; falling back")
+        logger
+
 
     # 2) 비스트리밍 폴백
     logger.info("LLM: non-streaming fallback path selected (stream=False)")

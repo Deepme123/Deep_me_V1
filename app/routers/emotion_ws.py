@@ -1,3 +1,4 @@
+# app/routers/emotion_ws.py
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlmodel import select
 from uuid import UUID
@@ -10,7 +11,7 @@ from contextlib import suppress
 
 from app.db.session import get_session
 from app.models.emotion import EmotionSession, EmotionStep
-from app.models.task import Task  # (타입 힌트/포맷용)
+from app.models.task import Task
 from app.services.llm_service import stream_noa_response
 from app.services.task_recommend import recommend_tasks_from_session_core
 from app.core.jwt import decode_access_token
@@ -26,8 +27,7 @@ from app.services.convo_policy import (
 SESSION_MAX_TURNS = int(os.getenv("SESSION_MAX_TURNS", "20"))
 WS_IDLE_TIMEOUT_SECS = int(os.getenv("WS_IDLE_TIMEOUT_SECS", "180"))
 AUTO_END_AFTER_ACTIVITY = os.getenv("AUTO_END_AFTER_ACTIVITY", "0") == "1"
-HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "8"))  # 최근 N 스텝만 전달
-# 닫기 토큰(영문은 소문자 기준)
+HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "8"))
 CLOSE_TOKENS = {"그만", "끝", "종료", "bye", "quit", "exit"}
 
 ws_router = APIRouter()
@@ -85,7 +85,7 @@ async def emotion_chat(websocket: WebSocket):
         await websocket.close(code=4401)
         return
 
-    # user_id 일치 검사(옵션)
+    # user_id 일치 검사
     qp = websocket.query_params
     qp_user_id = qp.get("user_id")
     if qp_user_id and qp_user_id != str(user_id):
@@ -100,10 +100,8 @@ async def emotion_chat(websocket: WebSocket):
         # 세션 확보/생성
         sess = None
         if session_id_param:
-            try:
+            with suppress(Exception):
                 sess = db.get(EmotionSession, UUID(session_id_param))
-            except Exception:
-                sess = None
         if sess is None:
             logger.info("Create new emotion session for user=%s", user_id)
             sess = EmotionSession(user_id=user_id, started_at=datetime.utcnow())
@@ -160,7 +158,7 @@ async def emotion_chat(websocket: WebSocket):
 - 간단한 끝인사 1줄
 """
 
-                # 최근 스텝 (역할 보존 전달)
+                # 최근 스텝
                 recent_all = db.exec(
                     select(EmotionStep)
                     .where(EmotionStep.session_id == sess.session_id)
@@ -168,8 +166,10 @@ async def emotion_chat(websocket: WebSocket):
                 ).all()
                 recent = recent_all[-HISTORY_TURNS:] if HISTORY_TURNS > 0 else recent_all
 
-                # 스트리밍 호출 (에러 가드 추가)
-                collected_tokens = []
+                # === LLM 응답 처리 구간 ===
+                collected_tokens: list[str] = []
+                first_token = False
+
                 try:
                     async for token_piece in _agen(
                         stream_noa_response(
@@ -181,14 +181,20 @@ async def emotion_chat(websocket: WebSocket):
                     ):
                         if token_piece:
                             collected_tokens.append(token_piece)
+                            first_token = True
                             await websocket.send_json({"token": token_piece})
                 except Exception as e:
                     logger.exception("LLM stream failed")
                     with suppress(Exception):
-                        await websocket.send_json({"error": f"LLM 설정 오류: {e}"})
+                        await websocket.send_json({"error": f"LLM 오류: {e}"})
                     continue
 
-                # 과제 추천(마무리 턴에는 비활성화)
+                if not first_token:
+                    with suppress(Exception):
+                        await websocket.send_json({"error": "LLM 응답이 비었습니다. 잠시 후 다시 시도해줘."})
+                    continue
+
+                # 과제 추천
                 try:
                     if not closing_turn and _should_recommend_tasks(user_input, sess):
                         await asyncio.sleep(2)
@@ -229,7 +235,7 @@ async def emotion_chat(websocket: WebSocket):
                     }
                 )
 
-                # 활동과제 마킹 및 선택적 즉시 종료
+                # 활동과제 마킹 및 종료 여부
                 if activity_turn:
                     mark_activity_injected(sess.session_id, db)
                     if AUTO_END_AFTER_ACTIVITY:
@@ -267,3 +273,4 @@ async def emotion_chat(websocket: WebSocket):
                 with suppress(Exception):
                     await websocket.send_json({"error": "internal_error"})
                 break
+

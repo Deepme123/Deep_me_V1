@@ -56,7 +56,7 @@ class EmotionStepGenerateInput(BaseModel):
     step_type: str
     user_input: str
     temperature: Optional[float] = 0.72
-    max_tokens: Optional[int] = 500
+    max_completion_tokens: Optional[int] = 500
     insight_tag: Optional[str] = None
     system_prompt: Optional[str] = None
 

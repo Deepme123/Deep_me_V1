@@ -34,9 +34,9 @@ def _get_openai_client_and_params():
     except ValueError:
         temperature = 0.7
     try:
-        max_tokens = int(os.getenv("LLM_MAX_TOKENS", "800"))
+        max_completion_tokens = int(os.getenv("LLM_MAX_TOKENS", "800"))
     except ValueError:
-        max_tokens = 800
+        max_completion_tokens = 800
 
     client_kwargs = {}
     base_url = os.getenv("OPENAI_BASE_URL")
@@ -50,7 +50,7 @@ def _get_openai_client_and_params():
         client_kwargs["project"] = project_id
 
     client = OpenAI(**client_kwargs)
-    return client, model, temperature, max_tokens
+    return client, model, temperature, max_completion_tokens
 
 
 @router.post("/", response_model=Task)
@@ -144,7 +144,7 @@ def recommend_tasks_from_gpt(
     user: User = Depends(get_current_user),
 ):
     prompt = get_task_prompt()
-    client, model, temperature, max_tokens = _get_openai_client_and_params()
+    client, model, temperature, max_completion_tokens = _get_openai_client_and_params()
 
     response = client.chat.completions.create(
         model=model,
@@ -153,7 +153,7 @@ def recommend_tasks_from_gpt(
             {"role": "user", "content": "지금 나에게 추천해줘."},
         ],
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_completion_tokens=max_completion_tokens,
     )
 
     result = (response.choices[0].message.content or "").strip()
@@ -230,12 +230,12 @@ def recommend_tasks_from_session(
         {"role": "user", "content": f"컨텍스트:\n{context_block}\n\n추천 개수: {payload.n}"},
     ]
 
-    client, model, temperature, max_tokens = _get_openai_client_and_params()
+    client, model, temperature, max_completion_tokens = _get_openai_client_and_params()
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_completion_tokens=max_completion_tokens,
     )
     raw = (resp.choices[0].message.content or "").strip()
 

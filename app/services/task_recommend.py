@@ -89,9 +89,9 @@ def recommend_tasks_from_session_core(
             temperature = 0.7
 
         try:
-            max_tokens = int(os.getenv("LLM_MAX_TOKENS", "800"))
+            max_completion_tokens = int(os.getenv("LLM_MAX_TOKENS", "800"))
         except ValueError:
-            max_tokens = 800
+            max_completion_tokens = 800
 
         # ---- OpenAI 클라이언트 구성 (선택적 커스텀 엔드포인트/조직/프로젝트) ----
         client_kwargs = {}
@@ -112,7 +112,7 @@ def recommend_tasks_from_session_core(
             model=model,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_completion_tokens,
         )
         raw = (resp.choices[0].message.content or "").strip()
 

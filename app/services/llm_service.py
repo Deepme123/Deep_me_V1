@@ -15,6 +15,7 @@ MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))
 TOP_P = float(os.getenv("LLM_TOP_P", "1.0"))
 TIMEOUT = float(os.getenv("LLM_TIMEOUT_SEC", "30"))  # 요청 타임아웃(초)
 CHUNK_SIZE = int(os.getenv("LLM_CHUNK_SIZE", "600"))  # WS로 보낼 조각 크기
+BACKUP_MODELS = (os.getenv("LLM_BACKUP_MODELS") or "gpt-4o-mini,gpt-4o").split(",")
 
 # ===== Utils =====
 def _chunk_text(s: str, n: int) -> Iterable[str]:
@@ -222,3 +223,24 @@ def _extract_text_from_stream_event(event) -> str:
     except Exception:
         logger.exception("extract_text_from_stream_event: failed")
         return ""
+
+def _fallback_non_stream_with_backups(client, messages) -> str:
+    # 1차: 현재 MODEL로 시도
+    resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
+    text = _extract_text_from_chat_completion(resp).strip()
+    if text:
+        return text
+
+    # 2차: 백업 모델 순회
+    for m in [m.strip() for m in BACKUP_MODELS if m.strip()]:
+        try:
+            logger.warning("LLM: trying backup model=%s", m)
+            resp2 = _safe_chat_create(client, model=m, messages=messages, stream=False)
+            t2 = _extract_text_from_chat_completion(resp2).strip()
+            if t2:
+                return t2
+        except Exception:
+            logger.exception("backup model failed: %s", m)
+
+    # 모두 실패
+    return ""

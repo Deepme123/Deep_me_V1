@@ -23,6 +23,7 @@ from app.services.convo_policy import (
     _turn_count,
 )
 
+# ──────────────────────────────────────────────────────────────────────────────
 # 설정
 SESSION_MAX_TURNS = int(os.getenv("SESSION_MAX_TURNS", "20"))
 WS_IDLE_TIMEOUT_SECS = int(os.getenv("WS_IDLE_TIMEOUT_SECS", "180"))
@@ -34,6 +35,8 @@ ws_router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
 def _should_recommend_tasks(user_text: str, sess: EmotionSession) -> bool:
     if not user_text:
         return False
@@ -59,6 +62,8 @@ async def _agen(gen):
             yield x
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# WebSocket
 @ws_router.websocket("/ws/emotion")
 async def emotion_chat(websocket: WebSocket):
     logger.info(
@@ -98,7 +103,7 @@ async def emotion_chat(websocket: WebSocket):
 
     with next(get_session()) as db:
         # 세션 확보/생성
-        sess = None
+        sess: EmotionSession | None = None
         if session_id_param:
             with suppress(Exception):
                 sess = db.get(EmotionSession, UUID(session_id_param))
@@ -185,11 +190,30 @@ async def emotion_chat(websocket: WebSocket):
                             logger.debug("WS sent token successfully")
                             collected_tokens.append(token_piece)
                             first_token = True
-                except Exception as e:
+
+                except RuntimeError as e:
+                    # 사람 친화적 에러 매핑 (세션 유지)
+                    msg = str(e)
+                    if msg == "blocked_by_content_filter":
+                        with suppress(Exception):
+                            await websocket.send_json(
+                                {"error": "안전필터에 의해 답변이 차단됐어. 질문을 조금 더 중립적으로 바꿔볼래?"}
+                            )
+                    elif msg == "empty_completion_from_llm":
+                        with suppress(Exception):
+                            await websocket.send_json(
+                                {"error": "모델이 답변을 비워 보냈어. 잠시 후 다시 시도하거나 질문을 조금 더 구체화해줘."}
+                            )
+                    else:
+                        with suppress(Exception):
+                            await websocket.send_json({"error": f"LLM 처리 중 오류가 발생했어: {msg}"})
+                    continue  # 세션은 닫지 않고 다음 입력 대기
+
+                except Exception:
                     logger.exception("LLM stream failed")
                     with suppress(Exception):
-                        await websocket.send_json({"error": f"LLM 오류: {e}"})
-                    continue
+                        await websocket.send_json({"error": "LLM 처리 중 알 수 없는 오류가 발생했어."})
+                    continue  # 세션 유지
 
                 if not first_token:
                     with suppress(Exception):
@@ -199,6 +223,7 @@ async def emotion_chat(websocket: WebSocket):
                 # 과제 추천
                 try:
                     if not closing_turn and _should_recommend_tasks(user_input, sess):
+                        # 짧은 지연으로 토큰 UX 구분
                         await asyncio.sleep(2)
                         tasks = await asyncio.to_thread(
                             recommend_tasks_from_session_core,

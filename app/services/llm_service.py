@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import os
 import logging
-from typing import Iterable, Generator, Optional
+from typing import Iterable, Optional
+
 from openai import OpenAI, BadRequestError
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,8 @@ MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))
 TOP_P = float(os.getenv("LLM_TOP_P", "1.0"))
 TIMEOUT = float(os.getenv("LLM_TIMEOUT_SEC", "30"))  # 요청 타임아웃(초)
 CHUNK_SIZE = int(os.getenv("LLM_CHUNK_SIZE", "600"))  # WS로 보낼 조각 크기
+BACKUP_MODELS = (os.getenv("LLM_BACKUP_MODELS") or "gpt-4o-mini,gpt-4o").split(",")
+
 
 # ===== Utils =====
 def _chunk_text(s: str, n: int) -> Iterable[str]:
@@ -44,16 +47,32 @@ def _log_bad_request(prefix: str, err: BadRequestError) -> None:
 
 def _safe_chat_create(client: OpenAI, *, model: str, messages: list[dict], stream: bool):
     """
-    파라미터 호환성 이슈에 대비해 단계적으로 옵션을 줄이며 호출.
-    1) temperature + top_p + max_completion_tokens
-    2) temperature + max_completion_tokens
-    3) max_completion_tokens
-    4) (최소) 필수 인자만
+    Chat Completions 호출을 파라미터 호환성 이슈에 대비해 단계적으로 시도.
+    - Chat Completions 표준: max_tokens
+    - (Responses API는 max_output_tokens이지만 여기선 사용 안 함)
     """
     attempts = [
-        dict(model=model, messages=messages, stream=stream, temperature=TEMPERATURE, top_p=TOP_P, max_completion_tokens=MAX_TOKENS),
-        dict(model=model, messages=messages, stream=stream, temperature=TEMPERATURE, max_completion_tokens=MAX_TOKENS),
-        dict(model=model, messages=messages, stream=stream, max_completion_tokens=MAX_TOKENS),
+        dict(
+            model=model,
+            messages=messages,
+            stream=stream,
+            temperature=TEMPERATURE,
+            top_p=TOP_P,
+            max_tokens=MAX_TOKENS,
+        ),
+        dict(
+            model=model,
+            messages=messages,
+            stream=stream,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+        ),
+        dict(
+            model=model,
+            messages=messages,
+            stream=stream,
+            max_tokens=MAX_TOKENS,
+        ),
         dict(model=model, messages=messages, stream=stream),
     ]
     last_err: Optional[Exception] = None
@@ -63,10 +82,10 @@ def _safe_chat_create(client: OpenAI, *, model: str, messages: list[dict], strea
         except BadRequestError as e:
             _log_bad_request(f"chat.create attempt#{i}", e)
             last_err = e
-            # 스트리밍이 아예 불가(조직 미인증/모델 미지원)면 상위에서 폴백시키도록 즉시 재던짐
+            # 스트리밍 자체가 정책/모델 제약으로 불가한 경우: 상위로 올려 폴백 경로 타게 함
             if stream and "param" in str(e).lower() and "stream" in str(e).lower():
                 raise
-        except Exception as e:
+        except Exception:
             logger.exception("chat.create attempt#%d unexpected error", i)
             last_err = e
     if last_err:
@@ -83,82 +102,203 @@ def _build_messages(*, system_prompt: str, recent_steps, user_input: str) -> lis
     msgs.append({"role": "user", "content": user_input})
     return msgs
 
+
+# ===== Extractors =====
+def _extract_text_from_chat_completion(resp) -> str:
+    """
+    Chat Completions 단발 응답에서 텍스트를 최대한 방어적으로 추출.
+    - 문자열 content
+    - 멀티모달 파츠(list) 내 text
+    - tool_calls만 있는 경우는 빈 문자열 처리
+    - 안전필터 차단은 명시적 예외
+    """
+    try:
+        choice = getattr(resp, "choices", [None])[0]
+        if not choice:
+            return ""
+        msg = getattr(choice, "message", None)
+        finish_reason = getattr(choice, "finish_reason", None)
+
+        # 1) content가 문자열
+        content = getattr(msg, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content
+
+        # 2) content가 파츠 배열 (멀티모달 텍스트 파트)
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    parts.append(p.get("text") or "")
+            merged = "".join(parts).strip()
+            if merged:
+                return merged
+
+        # 3) 툴콜만 있는 케이스: 우리 서비스는 툴콜 미사용 → 빈본문으로 간주
+        tool_calls = getattr(msg, "tool_calls", None) or getattr(msg, "function_call", None)
+        if tool_calls:
+            return ""
+
+        # 4) 안전필터 차단
+        if finish_reason == "content_filter":
+            raise RuntimeError("blocked_by_content_filter")
+
+        return ""
+    except Exception:
+        logger.exception("extract_text: failed; returning empty")
+        return ""
+
+
+def _extract_text_from_stream_event(event) -> str:
+    """
+    Chat Completions 스트림 이벤트에서 텍스트를 방어적으로 추출.
+    표준: event.choices[0].delta.content
+    일부 SDK/환경: event.delta / event.data 등 변형 가능 → dict 탐색
+    """
+    try:
+        # 표준 경로
+        choices = getattr(event, "choices", None)
+        if choices:
+            delta = getattr(choices[0], "delta", None)
+            content = getattr(delta, "content", None)
+            if isinstance(content, str):
+                return content
+
+        # 방어적 파싱 (dict화 시도)
+        d = None
+        if hasattr(event, "model_dump_json"):
+            import json
+
+            d = json.loads(event.model_dump_json())
+        elif hasattr(event, "dict"):
+            d = event.dict()
+        else:
+            d = getattr(event, "__dict__", {}) or {}
+
+        # 델타 텍스트 위치 탐색
+        for key in ("content", "text", "delta"):
+            v = d.get(key)
+            if isinstance(v, str):
+                return v
+            if isinstance(v, dict) and isinstance(v.get("content"), str):
+                return v["content"]
+
+        return ""
+    except Exception:
+        logger.exception("extract_text_from_stream_event: failed")
+        return ""
+
+
+def _fallback_non_stream_with_backups(client: OpenAI, messages: list[dict]) -> str:
+    """
+    비스트리밍 단발 호출을 현재 모델 → 백업 모델 순으로 시도.
+    성공 시 텍스트 반환, 전부 실패 시 빈 문자열.
+    """
+    # 1차: 현재 MODEL
+    try:
+        resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
+        text = _extract_text_from_chat_completion(resp).strip()
+        if text:
+            return text
+    except Exception:
+        logger.exception("non-stream primary attempt failed")
+
+    # 2차: 백업 모델 순회
+    for m in [m.strip() for m in BACKUP_MODELS if m.strip()]:
+        try:
+            logger.warning("LLM: trying backup model=%s", m)
+            resp2 = _safe_chat_create(client, model=m, messages=messages, stream=False)
+            t2 = _extract_text_from_chat_completion(resp2).strip()
+            if t2:
+                return t2
+        except Exception:
+            logger.exception("backup model failed: %s", m)
+
+    # 모두 실패
+    return ""
+
+
 # ===== Public API =====
 async def stream_noa_response(*, user_input, session, recent_steps, system_prompt):
+    """
+    스트리밍 우선 → 무토큰 시 비스트리밍 폴백 → 여전히 빈 응답이면
+    백업 모델로 재시도. 최종 실패 시 RuntimeError("empty_completion_from_llm") 발생.
+    """
     client = OpenAI(timeout=TIMEOUT)
-    messages = _build_messages(system_prompt=system_prompt, recent_steps=recent_steps, user_input=user_input)
+    messages = _build_messages(
+        system_prompt=system_prompt, recent_steps=recent_steps, user_input=user_input
+    )
 
+    # 1) 스트리밍 경로 시도
     try:
         logger.info("LLM: streaming path selected (attempting stream=True)")
         stream = _safe_chat_create(client, model=MODEL, messages=messages, stream=True)
 
-        yielded = False  # ✅ 추가: 한 토큰이라도 보냈는지 추적
+        yielded = False
         for event in stream:
-            logger.debug("stream event raw: %s", event)
-            try:
-                choice = getattr(event, "choices", [None])[0]
-                if not choice:
-                    continue
-                delta = getattr(choice, "delta", None)
-                content = getattr(delta, "content", None)
-                if content:
-                    yielded = True
-                    yield content
-            except Exception:
-                logger.exception("stream event parse error")
-
-        # ✅ 추가: 스트리밍에서 아무 토큰도 못 받았을 때 비-스트리밍 폴백
-        if not yielded:
-            logger.warning("LLM: stream yielded no content; falling back to non-streaming")
-            resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
-            try:
-                text = (resp.choices[0].message.content or "").strip()
-            except Exception:
-                logger.exception("failed to extract completion content")
-                text = ""
-
-            if not text:
-                raise RuntimeError("empty_completion_from_llm")
-
-            for piece in _chunk_text(text, CHUNK_SIZE):
+            piece = _extract_text_from_stream_event(event)
+            if piece:
+                yielded = True
                 yield piece
 
+        # 1-a) 스트림 무토큰 → 비스트리밍 폴백
+        if not yielded:
+            logger.warning("LLM: stream yielded no content; falling back to non-streaming")
+            text = _fallback_non_stream_with_backups(client, messages).strip()
+            if not text:
+                raise RuntimeError("empty_completion_from_llm")
+            for chunk in _chunk_text(text, CHUNK_SIZE):
+                yield chunk
         return
 
     except BadRequestError as e:
         emsg = str(e).lower()
-        if "must be verified to stream this model" in emsg or ("'param': 'stream'" in emsg and "unsupported_value" in emsg):
+        # 조직 검증/모델 제약으로 스트리밍 불가 → 아래 비스트리밍 폴백 경로로 이동
+        if "must be verified to stream this model" in emsg or (
+            "'param': 'stream'" in emsg and "unsupported_value" in emsg
+        ):
             logger.warning("LLM: stream not allowed; falling back to non-streaming (policy)")
         else:
             raise
     except Exception:
-        # ✅ 수정: 빈 'logger' 참조 대신 제대로 로그 남기기
         logger.exception("LLM: streaming failed unexpectedly; falling back to non-streaming")
 
-    # (기존) 폴백 경로 유지
+    # 2) 비스트리밍 폴백 (현재 모델 → 백업 모델)
     logger.info("LLM: non-streaming fallback path selected (stream=False)")
-    resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
-    try:
-        text = resp.choices[0].message.content or ""
-    except Exception:
-        logger.exception("failed to extract completion content")
-        text = ""
-    text = text.strip()
+    text = _fallback_non_stream_with_backups(client, messages).strip()
     if not text:
         raise RuntimeError("empty_completion_from_llm")
-    for piece in _chunk_text(text, CHUNK_SIZE):
-        yield piece
+    for chunk in _chunk_text(text, CHUNK_SIZE):
+        yield chunk
 
 
 def generate_noa_response(*, user_input: str, recent_steps, system_prompt: str) -> str:
     """
-    하위 호환(동기/단발 응답). 최신 파라미터 규칙으로 단발 응답을 반환.
+    동기/단발 호출. 현재 모델 → 백업 모델 순으로 시도 후 텍스트 반환.
+    실패 시 빈 문자열 반환.
     """
     client = OpenAI(timeout=TIMEOUT)
-    messages = _build_messages(system_prompt=system_prompt, recent_steps=recent_steps, user_input=user_input)
-    resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
+    messages = _build_messages(
+        system_prompt=system_prompt, recent_steps=recent_steps, user_input=user_input
+    )
+
+    # 현재 모델
     try:
-        return resp.choices[0].message.content or ""
+        resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
+        text = _extract_text_from_chat_completion(resp).strip()
+        if text:
+            return text
     except Exception:
-        logger.exception("generate_noa_response: failed to extract content")
-        return ""
+        logger.exception("generate_noa_response: primary attempt failed")
+
+    # 백업 모델 순회
+    for m in [m.strip() for m in BACKUP_MODELS if m.strip()]:
+        try:
+            resp2 = _safe_chat_create(client, model=m, messages=messages, stream=False)
+            t2 = _extract_text_from_chat_completion(resp2).strip()
+            if t2:
+                return t2
+        except Exception:
+            logger.exception("generate_noa_response: backup failed: %s", m)
+
+    return ""

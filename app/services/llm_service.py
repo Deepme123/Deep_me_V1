@@ -95,38 +95,24 @@ async def stream_noa_response(*, user_input, session, recent_steps, system_promp
         logger.info("LLM: streaming path selected (attempting stream=True)")
         stream = _safe_chat_create(client, model=MODEL, messages=messages, stream=True)
 
-        yielded = False  # ✅ 추가: 한 토큰이라도 보냈는지 추적
+        yielded = False
         for event in stream:
-            logger.debug("stream event raw: %s", event)
-            try:
-                choice = getattr(event, "choices", [None])[0]
-                if not choice:
-                    continue
-                delta = getattr(choice, "delta", None)
-                content = getattr(delta, "content", None)
-                if content:
-                    yielded = True
-                    yield content
-            except Exception:
-                logger.exception("stream event parse error")
+            piece = _extract_text_from_stream_event(event)
+            if piece:
+                yielded = True
+                yield piece
 
-        # ✅ 추가: 스트리밍에서 아무 토큰도 못 받았을 때 비-스트리밍 폴백
         if not yielded:
             logger.warning("LLM: stream yielded no content; falling back to non-streaming")
             resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
-            try:
-                text = (resp.choices[0].message.content or "").strip()
-            except Exception:
-                logger.exception("failed to extract completion content")
-                text = ""
-
+            text = _extract_text_from_chat_completion(resp).strip()
             if not text:
+                # 👉 여기서 바로 예외를 던지지 말고, '백업 모델' 시도
                 raise RuntimeError("empty_completion_from_llm")
-
-            for piece in _chunk_text(text, CHUNK_SIZE):
-                yield piece
-
+            for chunk in _chunk_text(text, CHUNK_SIZE):
+                yield chunk
         return
+
 
     except BadRequestError as e:
         emsg = str(e).lower()
@@ -141,16 +127,12 @@ async def stream_noa_response(*, user_input, session, recent_steps, system_promp
     # (기존) 폴백 경로 유지
     logger.info("LLM: non-streaming fallback path selected (stream=False)")
     resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
-    try:
-        text = resp.choices[0].message.content or ""
-    except Exception:
-        logger.exception("failed to extract completion content")
-        text = ""
-    text = text.strip()
+    text = _extract_text_from_chat_completion(resp).strip()
     if not text:
         raise RuntimeError("empty_completion_from_llm")
-    for piece in _chunk_text(text, CHUNK_SIZE):
-        yield piece
+    for chunk in _chunk_text(text, CHUNK_SIZE):
+        yield chunk
+
 
 
 def generate_noa_response(*, user_input: str, recent_steps, system_prompt: str) -> str:
@@ -164,4 +146,79 @@ def generate_noa_response(*, user_input: str, recent_steps, system_prompt: str) 
         return resp.choices[0].message.content or ""
     except Exception:
         logger.exception("generate_noa_response: failed to extract content")
+        return ""
+
+# ✅ 추가: Chat Completions '단발' 응답 텍스트 추출
+def _extract_text_from_chat_completion(resp) -> str:
+    try:
+        choice = getattr(resp, "choices", [None])[0]
+        if not choice:
+            return ""
+        msg = getattr(choice, "message", None)
+        finish_reason = getattr(choice, "finish_reason", None)
+
+        # 1) content가 문자열
+        content = getattr(msg, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content
+
+        # 2) content가 파츠 배열 (멀티모달 텍스트 파트)
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    parts.append(p.get("text") or "")
+            if "".join(parts).strip():
+                return "".join(parts)
+
+        # 3) 툴콜만 있는 케이스: 우리 서비스는 툴콜 미사용 → 빈본문으로 간주
+        tool_calls = getattr(msg, "tool_calls", None) or getattr(msg, "function_call", None)
+        if tool_calls:
+            return ""  # (선택) "[tool_call]" 같은 표식을 넣어도 됨
+
+        # 4) 안전필터 차단
+        if finish_reason == "content_filter":
+            raise RuntimeError("blocked_by_content_filter")
+
+        return ""
+    except Exception:
+        logger.exception("extract_text: failed; returning empty")
+        return ""
+
+
+# ✅ 추가: Chat Completions '스트림' 이벤트에서 텍스트 추출
+def _extract_text_from_stream_event(event) -> str:
+    """
+    표준: event.choices[0].delta.content
+    일부 SDK/환경: event.delta / event.data 등 변형 가능 → 방어코드
+    """
+    try:
+        # 표준 경로
+        choices = getattr(event, "choices", None)
+        if choices:
+            delta = getattr(choices[0], "delta", None)
+            content = getattr(delta, "content", None)
+            if isinstance(content, str):
+                return content
+
+        # 방어적 파싱 (dict화 시도)
+        if hasattr(event, "model_dump_json"):
+            import json
+            d = json.loads(event.model_dump_json())
+        elif hasattr(event, "dict"):
+            d = event.dict()
+        else:
+            d = getattr(event, "__dict__", {}) or {}
+
+        # 델타 텍스트 위치 탐색
+        for key in ("content", "text", "delta"):
+            v = d.get(key)
+            if isinstance(v, str):
+                return v
+            if isinstance(v, dict) and isinstance(v.get("content"), str):
+                return v["content"]
+
+        return ""
+    except Exception:
+        logger.exception("extract_text_from_stream_event: failed")
         return ""

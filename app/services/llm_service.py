@@ -51,9 +51,12 @@ def _safe_chat_create(client: OpenAI, *, model: str, messages: list[dict], strea
     4) (최소) 필수 인자만
     """
     attempts = [
-        dict(model=model, messages=messages, stream=stream, temperature=TEMPERATURE, top_p=TOP_P, max_completion_tokens=MAX_TOKENS),
-        dict(model=model, messages=messages, stream=stream, temperature=TEMPERATURE, max_completion_tokens=MAX_TOKENS),
-        dict(model=model, messages=messages, stream=stream, max_completion_tokens=MAX_TOKENS),
+        dict(model=model, messages=messages, stream=stream,
+            temperature=TEMPERATURE, top_p=TOP_P, max_tokens=MAX_TOKENS),
+        dict(model=model, messages=messages, stream=stream,
+            temperature=TEMPERATURE, max_tokens=MAX_TOKENS),
+        dict(model=model, messages=messages, stream=stream,
+            max_tokens=MAX_TOKENS),
         dict(model=model, messages=messages, stream=stream),
     ]
     last_err: Optional[Exception] = None

@@ -16,6 +16,7 @@ from app.models import refresh_token as _m_refresh  # noqa: F401
 # 라우터
 from app.routers import emotion, auth, user, task
 from app.routers.emotion_ws import ws_router as emotion_ws_router
+from app.routers import health_llm 
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ app.add_middleware(
 )
 
 # 라우터 등록
+app.include_router(health_llm.router)
 app.include_router(emotion.router)
 app.include_router(emotion_ws_router)
 app.include_router(auth.auth_router)

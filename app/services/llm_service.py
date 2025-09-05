@@ -22,7 +22,7 @@ DISABLE_STREAM_MODELS = set(
     s.strip() for s in os.getenv("LLM_DISABLE_STREAM_MODELS", "").split(",") if s.strip()
 )
 
-# 내부 시스템 지침(노출 금지) — 시스템 프롬프트 에코 방지
+# 시스템 프롬프트 에코 방지
 SYSTEM_GUARD = os.getenv(
     "SYSTEM_GUARD",
     (
@@ -44,24 +44,19 @@ def _log_bad_request(prefix: str, err: BadRequestError) -> None:
         logger.error("%s | BadRequestError: %s", prefix, str(err))
         resp = getattr(err, "response", None)
         if resp is not None:
-            try:
+            with contextlib.suppress(Exception):
                 logger.error("%s | response.status=%s", prefix, resp.status_code)
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 logger.error("%s | response.json=%s", prefix, resp.json())
-            except Exception:
-                try:
-                    logger.error("%s | response.text=%s", prefix, resp.text)
-                except Exception:
-                    pass
+            with contextlib.suppress(Exception):
+                logger.error("%s | response.text=%s", prefix, resp.text)
     except Exception:
         logger.exception("%s | failed to log BadRequestError", prefix)
 
 
 def _build_messages(*, system_prompt: str, recent_steps, user_input: str) -> List[Dict[str, Any]]:
     """
-    Chat Completions용 messages + Responses용 input 모두에 재사용 가능한 포맷(role/content).
+    Chat Completions / Responses 공용 포맷(role/content).
     """
     msgs: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_GUARD},
@@ -79,51 +74,28 @@ def _build_messages(*, system_prompt: str, recent_steps, user_input: str) -> Lis
 # ===== Chat Completions helpers =====
 def _safe_chat_create(client: OpenAI, *, model: str, messages: list[dict], stream: bool):
     """
-    Chat Completions 호출을 파라미터 호환성에 따라 단계적으로 시도.
-    - 일부 모델: max_tokens 미지원 → max_completion_tokens만 허용
+    모델별 파라미터 차이를 흡수하기 위해 단계적으로 호출.
+    - 일부 모델: max_completion_tokens만 허용
     - 일부 모델: max_tokens만 허용
-    둘 다 대비해서 시퀀스를 깔고, 마지막엔 최소 인자로 호출.
     """
+    stream_opts = {"stream_options": {"include_usage": True}} if stream else {}
     attempts = [
         # 1) max_completion_tokens + temperature/top_p
-        dict(
-            model=model,
-            messages=messages,
-            stream=stream,
-            temperature=TEMPERATURE,
-            top_p=TOP_P,
-            max_completion_tokens=MAX_TOKENS,
-            # 스트리밍 사용량 포함(가능한 SDK에서만 적용)
-            **({"stream_options": {"include_usage": True}} if stream else {}),
-        ),
-        dict(
-            model=model,
-            messages=messages,
-            stream=stream,
-            temperature=TEMPERATURE,
-            max_completion_tokens=MAX_TOKENS,
-            **({"stream_options": {"include_usage": True}} if stream else {}),
-        ),
+        dict(model=model, messages=messages, stream=stream,
+             temperature=TEMPERATURE, top_p=TOP_P,
+             max_completion_tokens=MAX_TOKENS, **stream_opts),
+        dict(model=model, messages=messages, stream=stream,
+             temperature=TEMPERATURE,
+             max_completion_tokens=MAX_TOKENS, **stream_opts),
         # 2) max_tokens + temperature/top_p
-        dict(
-            model=model,
-            messages=messages,
-            stream=stream,
-            temperature=TEMPERATURE,
-            top_p=TOP_P,
-            max_tokens=MAX_TOKENS,
-            **({"stream_options": {"include_usage": True}} if stream else {}),
-        ),
-        dict(
-            model=model,
-            messages=messages,
-            stream=stream,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            **({"stream_options": {"include_usage": True}} if stream else {}),
-        ),
+        dict(model=model, messages=messages, stream=stream,
+             temperature=TEMPERATURE, top_p=TOP_P,
+             max_tokens=MAX_TOKENS, **stream_opts),
+        dict(model=model, messages=messages, stream=stream,
+             temperature=TEMPERATURE,
+             max_tokens=MAX_TOKENS, **stream_opts),
         # 3) 최소 인자
-        dict(model=model, messages=messages, stream=stream, **({"stream_options": {"include_usage": True}} if stream else {})),
+        dict(model=model, messages=messages, stream=stream, **stream_opts),
     ]
     last_err: Optional[Exception] = None
     for i, payload in enumerate(attempts, 1):
@@ -132,7 +104,7 @@ def _safe_chat_create(client: OpenAI, *, model: str, messages: list[dict], strea
         except BadRequestError as e:
             _log_bad_request(f"chat.create attempt#{i}", e)
             last_err = e
-            # 스트리밍 자체가 정책/모델 제약으로 불가하면 상위에서 폴백
+            # 스트리밍 자체가 금지된 케이스는 상위 폴백을 위해 재던짐
             if stream and "param" in str(e).lower() and "stream" in str(e).lower():
                 raise
         except Exception:
@@ -143,9 +115,7 @@ def _safe_chat_create(client: OpenAI, *, model: str, messages: list[dict], strea
 
 
 def _extract_text_from_chat_completion(resp) -> str:
-    """
-    Chat Completions 단발 응답에서 텍스트 방어적 추출.
-    """
+    """단발 응답에서 텍스트 방어적 추출."""
     try:
         choice = getattr(resp, "choices", [None])[0]
         if not choice:
@@ -180,10 +150,7 @@ def _extract_text_from_chat_completion(resp) -> str:
 
 
 def _extract_text_from_stream_event(event) -> str:
-    """
-    Chat Completions 스트림 이벤트에서 텍스트 추출.
-    표준: event.choices[0].delta.content
-    """
+    """Chat Completions 스트림 이벤트에서 텍스트 추출."""
     try:
         choices = getattr(event, "choices", None)
         if choices:
@@ -192,7 +159,7 @@ def _extract_text_from_stream_event(event) -> str:
             if isinstance(content, str):
                 return content
 
-        # dict계 방어
+        # dict 방어
         d = None
         if hasattr(event, "model_dump_json"):
             import json
@@ -217,21 +184,16 @@ def _extract_text_from_stream_event(event) -> str:
 
 # ===== Responses API helpers (GPT-5 권장) =====
 def _responses_build_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Responses API에 그대로 넣을 수 있는 input 배열을 만든다.
-    (role/content 구조 그대로 사용)
-    """
-    return messages  # 현재 포맷이 이미 호환됨
+    """Responses API input 형식(role/content) 그대로 사용."""
+    return messages
 
 
 def _responses_stream(client: OpenAI, *, model: str, inputs: List[Dict[str, Any]]):
     """
     Responses API 스트리밍 제너레이터.
     yield: 텍스트 델타(str)
-    예외: content filter/기타 에러는 상위에서 처리
     """
     yielded = 0
-    # temperature/top_p/max_output_tokens 매핑
     with client.responses.stream(
         model=model,
         input=inputs,
@@ -240,7 +202,6 @@ def _responses_stream(client: OpenAI, *, model: str, inputs: List[Dict[str, Any]
         top_p=TOP_P,
     ) as stream:
         for event in stream:
-            # SDK별 속성명이 다를 수 있으니 안전하게 접근
             etype = getattr(event, "type", None) or getattr(event, "event", "") or ""
             data = getattr(event, "data", {}) or {}
 
@@ -250,16 +211,13 @@ def _responses_stream(client: OpenAI, *, model: str, inputs: List[Dict[str, Any]
                     yielded += 1
                     yield piece
             elif "response.error" in etype:
-                # 필요하면 세부 오류에 따라 분기
                 raise RuntimeError(str(data) or "responses_stream_error")
             elif "response.completed" in etype:
-                # usage 계측 시도(있으면 로깅)
-                try:
+                # usage 있으면 로깅
+                with contextlib.suppress(Exception):
                     usage = getattr(event, "usage", None) or data.get("usage")
                     if usage:
                         logger.info("LLM: responses usage=%s", usage)
-                except Exception:
-                    pass
                 break
 
     logger.info("LLM: responses stream finished yielded=%d", yielded)
@@ -267,19 +225,16 @@ def _responses_stream(client: OpenAI, *, model: str, inputs: List[Dict[str, Any]
 
 def _fallback_non_stream_with_backups(client: OpenAI, messages: list[dict]) -> str:
     """
-    비스트리밍 단발 호출을 현재 모델 → 백업 모델 순으로 시도.
-    성공 시 텍스트 반환, 전부 실패 시 빈 문자열.
+    비스트리밍 단발 호출: 현재 모델 → 백업 모델 순으로 시도.
     """
     # 1차: 현재 MODEL
     try:
         resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
-        # finish reason 로깅
-        try:
+        with contextlib.suppress(Exception):
             fr = getattr(resp.choices[0], "finish_reason", None)
-        except Exception:
-            fr = None
+            logger.info("LLM: non-stream primary finish_reason=%s", fr)
         text = _extract_text_from_chat_completion(resp).strip()
-        logger.info("LLM: non-stream primary len=%d finish_reason=%s", len(text), fr)
+        logger.info("LLM: non-stream primary len=%d", len(text))
         if text:
             return text
     except Exception:
@@ -297,11 +252,12 @@ def _fallback_non_stream_with_backups(client: OpenAI, messages: list[dict]) -> s
         except Exception:
             logger.exception("backup model failed: %s", m)
 
-    # 모두 실패
     return ""
 
 
 # ===== Public API =====
+import contextlib
+
 async def stream_noa_response(*, user_input, session, recent_steps, system_prompt):
     """
     GPT-5: Responses 스트림 우선 → 무토큰 시 비스트리밍 폴백 → 백업 모델
@@ -320,13 +276,12 @@ async def stream_noa_response(*, user_input, session, recent_steps, system_promp
             yield chunk
         return
 
-    # GPT-5 계열 + Responses 사용 설정이면 Responses 스트림 우선
+    # GPT-5 + Responses 사용 설정이면 Responses 스트림 우선
     if USE_RESPONSES and MODEL.startswith("gpt-5"):
         try:
             logger.info("LLM: responses stream path selected")
             inputs = _responses_build_input(messages)
             yielded_count = 0
-            async_mode = False  # 동기 제너레이터 사용
             for piece in _responses_stream(client, model=MODEL, inputs=inputs):
                 yielded_count += 1
                 yield piece
@@ -342,7 +297,6 @@ async def stream_noa_response(*, user_input, session, recent_steps, system_promp
 
         except BadRequestError as e:
             logger.warning("LLM: responses stream not allowed; falling back. err=%s", e)
-            # 이어서 Chat Completions 경로 또는 비스트리밍으로 폴백
         except Exception:
             logger.exception("LLM: responses stream failed; falling back to non-stream")
             text = _fallback_non_stream_with_backups(client, messages).strip()
@@ -352,7 +306,7 @@ async def stream_noa_response(*, user_input, session, recent_steps, system_promp
                 yield chunk
             return
 
-    # ─ Chat Completions 스트리밍 경로 (기존)
+    # ─ Chat Completions 스트리밍 경로
     try:
         logger.info("LLM: streaming path selected (attempting chat.completions stream=True)")
         stream = _safe_chat_create(client, model=MODEL, messages=messages, stream=True)
@@ -385,4 +339,40 @@ async def stream_noa_response(*, user_input, session, recent_steps, system_promp
     except Exception:
         logger.exception("LLM: streaming failed unexpectedly; falling back to non-streaming")
 
-    # 비스트리밍 폴백 (현재 모델 → 백
+    # 비스트리밍 폴백 (현재 모델 → 백업 모델)
+    logger.info("LLM: non-streaming fallback path selected (stream=False)")
+    text = _fallback_non_stream_with_backups(client, messages).strip()
+    if not text:
+        raise RuntimeError("empty_completion_from_llm")
+    for chunk in _chunk_text(text, CHUNK_SIZE):
+        yield chunk
+
+
+def generate_noa_response(*, user_input: str, recent_steps, system_prompt: str) -> str:
+    """
+    동기/단발 호출: 현재 모델 → 백업 모델 순으로 시도 후 텍스트 반환.
+    실패 시 빈 문자열.
+    """
+    client = OpenAI(timeout=TIMEOUT)
+    messages = _build_messages(system_prompt=system_prompt, recent_steps=recent_steps, user_input=user_input)
+
+    # 현재 모델
+    try:
+        resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
+        text = _extract_text_from_chat_completion(resp).strip()
+        if text:
+            return text
+    except Exception:
+        logger.exception("generate_noa_response: primary attempt failed")
+
+    # 백업 모델 순회
+    for m in [m.strip() for m in BACKUP_MODELS if m.strip()]:
+        try:
+            resp2 = _safe_chat_create(client, model=m, messages=messages, stream=False)
+            t2 = _extract_text_from_chat_completion(resp2).strip()
+            if t2:
+                return t2
+        except Exception:
+            logger.exception("generate_noa_response: backup failed: %s", m)
+
+    return ""

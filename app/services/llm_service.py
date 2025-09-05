@@ -84,21 +84,17 @@ def _build_messages(*, system_prompt: str, recent_steps, user_input: str) -> lis
     return msgs
 
 # ===== Public API =====
-async def stream_noa_response(*, user_input, session, recent_steps, system_prompt) -> Generator[str, None, None]:
-    """
-    스트리밍 우선 시도 → 불가 시 비스트리밍 폴백.
-    빈 응답은 RuntimeError로 승격해 상위(WS)에서 사용자에게 에러 안내.
-    """
+async def stream_noa_response(*, user_input, session, recent_steps, system_prompt):
     client = OpenAI(timeout=TIMEOUT)
     messages = _build_messages(system_prompt=system_prompt, recent_steps=recent_steps, user_input=user_input)
 
     try:
         logger.info("LLM: streaming path selected (attempting stream=True)")
         stream = _safe_chat_create(client, model=MODEL, messages=messages, stream=True)
-        for event in stream:
-            # 이벤트 원문 먼저 찍기 (모든 이벤트 추적)
-            logger.debug("stream event raw: %s", event)
 
+        yielded = False  # ✅ 추가: 한 토큰이라도 보냈는지 추적
+        for event in stream:
+            logger.debug("stream event raw: %s", event)
             try:
                 choice = getattr(event, "choices", [None])[0]
                 if not choice:
@@ -106,21 +102,40 @@ async def stream_noa_response(*, user_input, session, recent_steps, system_promp
                 delta = getattr(choice, "delta", None)
                 content = getattr(delta, "content", None)
                 if content:
+                    yielded = True
                     yield content
             except Exception:
                 logger.exception("stream event parse error")
+
+        # ✅ 추가: 스트리밍에서 아무 토큰도 못 받았을 때 비-스트리밍 폴백
+        if not yielded:
+            logger.warning("LLM: stream yielded no content; falling back to non-streaming")
+            resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
+            try:
+                text = (resp.choices[0].message.content or "").strip()
+            except Exception:
+                logger.exception("failed to extract completion content")
+                text = ""
+
+            if not text:
+                raise RuntimeError("empty_completion_from_llm")
+
+            for piece in _chunk_text(text, CHUNK_SIZE):
+                yield piece
+
         return
+
     except BadRequestError as e:
         emsg = str(e).lower()
         if "must be verified to stream this model" in emsg or ("'param': 'stream'" in emsg and "unsupported_value" in emsg):
-            logger.warning("LLM: stream not allowed; falling back to non-streaming")
+            logger.warning("LLM: stream not allowed; falling back to non-streaming (policy)")
         else:
             raise
     except Exception:
-        logger
+        # ✅ 수정: 빈 'logger' 참조 대신 제대로 로그 남기기
+        logger.exception("LLM: streaming failed unexpectedly; falling back to non-streaming")
 
-
-    # 2) 비스트리밍 폴백
+    # (기존) 폴백 경로 유지
     logger.info("LLM: non-streaming fallback path selected (stream=False)")
     resp = _safe_chat_create(client, model=MODEL, messages=messages, stream=False)
     try:
@@ -128,11 +143,9 @@ async def stream_noa_response(*, user_input, session, recent_steps, system_promp
     except Exception:
         logger.exception("failed to extract completion content")
         text = ""
-
     text = text.strip()
     if not text:
         raise RuntimeError("empty_completion_from_llm")
-
     for piece in _chunk_text(text, CHUNK_SIZE):
         yield piece
 

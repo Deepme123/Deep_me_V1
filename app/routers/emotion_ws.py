@@ -1,4 +1,6 @@
 # app/routers/emotion_ws.py
+from __future__ import annotations
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlmodel import select
 from uuid import UUID
@@ -7,6 +9,7 @@ import asyncio
 import logging
 import inspect
 import os
+import re
 from contextlib import suppress
 
 from app.db.session import get_session
@@ -34,15 +37,13 @@ CLOSE_TOKENS = {"그만", "끝", "종료", "bye", "quit", "exit"}
 ws_router = APIRouter()
 logger = logging.getLogger(__name__)
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Helpers (기존 + 추가)
 def _should_recommend_tasks(user_text: str, sess: EmotionSession) -> bool:
     if not user_text:
         return False
     kw = ("과제", "활동", "뭐 해볼까", "추천해줘", "해볼만한", "미션")
     return any(k in user_text for k in kw)
-
 
 def _format_tasks_as_chat(tasks: list[Task]) -> str:
     lines = ["", "📝 활동과제 추천"]
@@ -52,7 +53,6 @@ def _format_tasks_as_chat(tasks: list[Task]) -> str:
     lines.append("\n작게 시작하고, 완료하면 체크해줘. ✅")
     return "\n".join(lines)
 
-
 async def _agen(gen):
     if inspect.isasyncgen(gen):
         async for x in gen:
@@ -61,6 +61,47 @@ async def _agen(gen):
         for x in gen:
             yield x
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Leak guard helpers (추가)
+_LEAK_MARKERS = [
+    r"<<SYS>>",
+    r"BEGIN SYSTEM PROMPT",
+    r"\[SYSTEM\]",
+    r"DO NOT DISCLOSE",
+    r"internal rule",
+    r"developer prompt",
+]
+
+def _fingerprint(text: str, n: int = 10) -> set[int]:
+    if not text:
+        return set()
+    step = max(3, n // 2)
+    return {hash(text[i:i+n]) for i in range(0, max(0, len(text) - n + 1), step)}
+
+def _might_leak(text: str, sys_fp: set[int], n: int = 10) -> bool:
+    if not text or not sys_fp:
+        return False
+    step = max(3, n // 2)
+    fp = {hash(text[i:i+n]) for i in range(0, max(0, len(text) - n + 1), step)}
+    return len(sys_fp & fp) >= 2  # 두 조각 이상 매칭 시 누설로 간주
+
+def _redact(text: str) -> str:
+    out = text
+    for pat in _LEAK_MARKERS:
+        out = re.sub(pat, "[redacted]", out, flags=re.I)
+    return out
+
+def _sanitize_out(piece: str, sys_fp: set[int]) -> str:
+    """출력 직전 필터. 누설 징후면 통째로 redacted, 아니면 마커만 치환."""
+    if not isinstance(piece, str) or not piece:
+        return ""
+    if _might_leak(piece, sys_fp):
+        return "[redacted]"
+    return _redact(piece)
+
+def _mask_preview(s: str, k: int = 80) -> str:
+    s = s.replace("\n", " ")
+    return (s[:k] + "…") if len(s) > k else s
 
 # ──────────────────────────────────────────────────────────────────────────────
 # WebSocket
@@ -163,6 +204,9 @@ async def emotion_chat(websocket: WebSocket):
 - 간단한 끝인사 1줄
 """
 
+                # 이 턴의 시스템 프롬프트 핑거프린트 생성
+                sys_fp = _fingerprint(system_prompt, n=10)
+
                 # 최근 스텝
                 recent_all = db.exec(
                     select(EmotionStep)
@@ -184,12 +228,20 @@ async def emotion_chat(websocket: WebSocket):
                             system_prompt=system_prompt,
                         )
                     ):
-                        if token_piece:
-                            logger.debug("WS about to send token: %s", token_piece)
-                            await websocket.send_json({"token": token_piece})
-                            logger.debug("WS sent token successfully")
-                            collected_tokens.append(token_piece)
-                            first_token = True
+                        if not token_piece:
+                            continue
+                        # 출력 직전 정제
+                        safe_piece = _sanitize_out(token_piece, sys_fp)
+                        if not safe_piece:
+                            continue
+
+                        # 로깅은 마스킹 프리뷰로
+                        logger.debug("WS send token preview: %r", _mask_preview(safe_piece))
+
+                        # 프론트에는 텍스트만 전달
+                        await websocket.send_json({"token": safe_piece})
+                        collected_tokens.append(safe_piece)
+                        first_token = True
 
                 except RuntimeError as e:
                     # 사람 친화적 에러 매핑 (세션 유지)
@@ -234,6 +286,8 @@ async def emotion_chat(websocket: WebSocket):
                             max_history_chars=1000,
                         )
                         tasks_text = _format_tasks_as_chat(tasks)
+                        # 안전상 동일 정제 적용(옵션)
+                        tasks_text = _sanitize_out(tasks_text, sys_fp)
                         await websocket.send_json({"token": tasks_text})
                         collected_tokens.append(tasks_text)
                 except Exception:

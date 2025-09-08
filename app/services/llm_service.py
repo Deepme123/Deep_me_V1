@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import logging
 from typing import Iterable, Optional, List, Dict, Any
+import re
 
 from openai import OpenAI, BadRequestError
 
@@ -212,44 +213,31 @@ def _responses_build_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any
 # ── 교체 대상: _responses_stream 함수 본문 ──
 def _responses_stream(client, *, model: str, inputs):
     yielded = 0
-
-    # 컨텍스트 매니저 필수 (안 그러면 ResponseStreamManager는 iterable 아님)
     with client.responses.stream(model=model, input=inputs) as stream:
-        # 일부 환경/버전에서 stream 자체가 iterable
-        # 혹은 stream.events()로만 동작하는 경우가 있어 둘 다 지원
-        iterator = getattr(stream, "__iter__", None)
-        events_iter = stream if callable(iterator) else stream.events()
-
-        for event in events_iter:
+        iter_obj = stream if hasattr(stream, "__iter__") else stream.events()
+        for event in iter_obj:
             etype = getattr(event, "type", "") or getattr(event, "event", "")
             data = getattr(event, "data", {}) or {}
 
-            # 텍스트 조각 델타
-            if "response.output_text.delta" in etype or "response.refusal.delta" in etype:
+            # ✅ 오직 출력 텍스트 델타만 사용자로 보냄
+            if "response.output_text.delta" in etype:
                 piece = getattr(event, "delta", None) or data.get("delta") or ""
                 if piece:
                     yielded += 1
-                    yield piece
+                    yield _redact_if_needed(piece)  # ← 출력 직전 레드랙션
 
-            # 완료 이벤트: 델타가 0회면 최종 output_text로 보정
+            # ✅ 델타가 0회일 때만 완료 텍스트 보정
             elif "response.completed" in etype:
                 if yielded == 0:
                     final = getattr(event, "output_text", None) or data.get("output_text")
                     if isinstance(final, str) and final:
-                        yielded += 1
-                        yield final
-                # (선택) usage 로깅
-                try:
-                    usage = getattr(event, "usage", None) or data.get("usage")
-                    if usage:
-                        logger.info("LLM: responses usage=%s", usage)
-                except Exception:
-                    pass
+                        yield _redact_if_needed(final)
                 break
 
-            elif "response.error" in etype:
-                # 스트림 내부 에러 surfaced
-                raise RuntimeError(str(data) or "responses_stream_error")
+            # ❌ 입력/메타/에러 이벤트는 내부 처리만 (UI 전송 금지)
+            else:
+                # 필요시 내부 로깅만
+                continue
 
     logger.info("LLM: responses stream finished yielded=%d", yielded)
 
@@ -409,3 +397,27 @@ def generate_noa_response(*, user_input: str, recent_steps, system_prompt: str) 
             logger.exception("generate_noa_response: backup failed: %s", m)
 
     return ""
+
+SYSTEM_MARKERS = [r"<<SYS>>", r"BEGIN SYSTEM PROMPT", r"\[SYSTEM\]"]
+_SYS_FP = None  # 시스템 프롬프트 n-gram 지문
+
+def _init_sys_fingerprint(system_prompt: str, n: int = 10):
+    global _SYS_FP
+    _SYS_FP = {hash(system_prompt[i:i+n]) for i in range(0, len(system_prompt)-n+1, max(3, n//2))}
+
+def _might_leak(text: str, n: int = 10) -> bool:
+    if not _SYS_FP:
+        return False
+    fp = {hash(text[i:i+n]) for i in range(0, len(text)-n+1, max(3, n//2))}
+    return len(_SYS_FP & fp) >= 2  # 두 조각 이상 매칭되면 누설로 간주
+
+def _redact_if_needed(text: str) -> str:
+    # 지문 매칭 시 차단/치환
+    if _might_leak(text):
+        logger.warning("LLM: prompt-leak detected; blocking chunk")
+        return "[redacted]"
+    # 마커 패턴 레드랙션
+    out = text
+    for pat in SYSTEM_MARKERS:
+        out = re.sub(pat, "[redacted]", out, flags=re.I)
+    return out

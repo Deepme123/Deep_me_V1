@@ -114,8 +114,8 @@ def _safe_chat_create(client: OpenAI, *, model: str, messages: list[dict], strea
         raise last_err
 
 
+# 1) Chat Completions 응답 파싱 보강
 def _extract_text_from_chat_completion(resp) -> str:
-    """단발 응답에서 텍스트 방어적 추출."""
     try:
         choice = getattr(resp, "choices", [None])[0]
         if not choice:
@@ -124,21 +124,40 @@ def _extract_text_from_chat_completion(resp) -> str:
         finish_reason = getattr(choice, "finish_reason", None)
 
         content = getattr(msg, "content", None)
+
+        # 문자열 그대로 오는 경우
         if isinstance(content, str) and content.strip():
             return content
 
+        # 👉 파츠 리스트로 오는 최신 포맷 대응
         if isinstance(content, list):
-            parts = []
+            parts: list[str] = []
             for p in content:
-                if isinstance(p, dict) and p.get("type") == "text":
-                    parts.append(p.get("text") or "")
+                if isinstance(p, str):
+                    if p.strip():
+                        parts.append(p)
+                elif isinstance(p, dict):
+                    # type: "text" | "output_text" 등
+                    t = p.get("text") or p.get("output_text") or p.get("content")
+                    if isinstance(t, str) and t.strip():
+                        parts.append(t)
             merged = "".join(parts).strip()
             if merged:
                 return merged
 
+        # 함수/툴콜만 있고 텍스트가 없는 케이스는 빈 문자열 유지
         tool_calls = getattr(msg, "tool_calls", None) or getattr(msg, "function_call", None)
         if tool_calls:
             return ""
+
+        if finish_reason == "content_filter":
+            raise RuntimeError("blocked_by_content_filter")
+
+        return ""
+    except Exception:
+        logger.exception("extract_text: failed; returning empty")
+        return ""
+
 
         if finish_reason == "content_filter":
             raise RuntimeError("blocked_by_content_filter")
@@ -188,39 +207,44 @@ def _responses_build_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any
     return messages
 
 
+# 2) Responses 스트림 완료 보정 (델타 0회일 때 최종 output_text 사용)
 def _responses_stream(client: OpenAI, *, model: str, inputs: List[Dict[str, Any]]):
-    """
-    Responses API 스트리밍 제너레이터.
-    yield: 텍스트 델타(str)
-    """
+    stream = client.responses.stream(model=model, input=inputs)
     yielded = 0
-    with client.responses.stream(
-        model=model,
-        input=inputs,
-        max_output_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
-        top_p=TOP_P,
-    ) as stream:
-        for event in stream:
-            etype = getattr(event, "type", None) or getattr(event, "event", "") or ""
-            data = getattr(event, "data", {}) or {}
+    for event in stream:
+        etype = getattr(event, "type", "") or getattr(event, "event", "") or ""
+        data = getattr(event, "data", {}) or {}
 
-            if "response.output_text.delta" in etype:
-                piece = str(data.get("delta") or "")
-                if piece:
+        # 기본 텍스트 델타
+        if "response.output_text.delta" in etype or "response.refusal.delta" in etype:
+            piece = str(getattr(event, "delta", None) or data.get("delta") or "")
+            if piece:
+                yielded += 1
+                yield piece
+
+        elif "response.completed" in etype:
+            # 델타가 한 번도 없었으면, 완료 시점의 최종 텍스트로 보정
+            if yielded == 0:
+                final = (
+                    getattr(event, "output_text", None)
+                    or data.get("output_text")
+                )
+                if isinstance(final, str) and final:
                     yielded += 1
-                    yield piece
-            elif "response.error" in etype:
-                raise RuntimeError(str(data) or "responses_stream_error")
-            elif "response.completed" in etype:
-                # usage 있으면 로깅
-                with contextlib.suppress(Exception):
-                    usage = getattr(event, "usage", None) or data.get("usage")
-                    if usage:
-                        logger.info("LLM: responses usage=%s", usage)
-                break
+                    yield final
+
+            # (선택) usage 로깅
+            with contextlib.suppress(Exception):
+                usage = getattr(event, "usage", None) or data.get("usage")
+                if usage:
+                    logger.info("LLM: responses usage=%s", usage)
+            break
+
+        elif "response.error" in etype:
+            raise RuntimeError(str(data) or "responses_stream_error")
 
     logger.info("LLM: responses stream finished yielded=%d", yielded)
+
 
 
 def _fallback_non_stream_with_backups(client: OpenAI, messages: list[dict]) -> str:

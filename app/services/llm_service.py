@@ -115,6 +115,7 @@ def _safe_chat_create(client: OpenAI, *, model: str, messages: list[dict], strea
 
 
 # 1) Chat Completions 응답 파싱 보강
+# ── 교체 대상: _extract_text_from_chat_completion ──
 def _extract_text_from_chat_completion(resp) -> str:
     try:
         choice = getattr(resp, "choices", [None])[0]
@@ -122,22 +123,21 @@ def _extract_text_from_chat_completion(resp) -> str:
             return ""
         msg = getattr(choice, "message", None)
         finish_reason = getattr(choice, "finish_reason", None)
-
         content = getattr(msg, "content", None)
 
-        # 문자열 그대로 오는 경우
+        # 1) 문자열 그대로인 경우
         if isinstance(content, str) and content.strip():
             return content
 
-        # 👉 파츠 리스트로 오는 최신 포맷 대응
+        # 2) 파츠 리스트 포맷 대응
         if isinstance(content, list):
-            parts: list[str] = []
+            parts = []
             for p in content:
                 if isinstance(p, str):
                     if p.strip():
                         parts.append(p)
                 elif isinstance(p, dict):
-                    # type: "text" | "output_text" 등
+                    # 다양한 키 케이스 대응
                     t = p.get("text") or p.get("output_text") or p.get("content")
                     if isinstance(t, str) and t.strip():
                         parts.append(t)
@@ -145,7 +145,7 @@ def _extract_text_from_chat_completion(resp) -> str:
             if merged:
                 return merged
 
-        # 함수/툴콜만 있고 텍스트가 없는 케이스는 빈 문자열 유지
+        # 3) 툴콜만 있는 응답은 빈 문자열 유지
         tool_calls = getattr(msg, "tool_calls", None) or getattr(msg, "function_call", None)
         if tool_calls:
             return ""
@@ -157,6 +157,7 @@ def _extract_text_from_chat_completion(resp) -> str:
     except Exception:
         logger.exception("extract_text: failed; returning empty")
         return ""
+
 
 
         if finish_reason == "content_filter":
@@ -208,42 +209,50 @@ def _responses_build_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any
 
 
 # 2) Responses 스트림 완료 보정 (델타 0회일 때 최종 output_text 사용)
-def _responses_stream(client: OpenAI, *, model: str, inputs: List[Dict[str, Any]]):
-    stream = client.responses.stream(model=model, input=inputs)
+# ── 교체 대상: _responses_stream 함수 본문 ──
+def _responses_stream(client, *, model: str, inputs):
     yielded = 0
-    for event in stream:
-        etype = getattr(event, "type", "") or getattr(event, "event", "") or ""
-        data = getattr(event, "data", {}) or {}
 
-        # 기본 텍스트 델타
-        if "response.output_text.delta" in etype or "response.refusal.delta" in etype:
-            piece = str(getattr(event, "delta", None) or data.get("delta") or "")
-            if piece:
-                yielded += 1
-                yield piece
+    # 컨텍스트 매니저 필수 (안 그러면 ResponseStreamManager는 iterable 아님)
+    with client.responses.stream(model=model, input=inputs) as stream:
+        # 일부 환경/버전에서 stream 자체가 iterable
+        # 혹은 stream.events()로만 동작하는 경우가 있어 둘 다 지원
+        iterator = getattr(stream, "__iter__", None)
+        events_iter = stream if callable(iterator) else stream.events()
 
-        elif "response.completed" in etype:
-            # 델타가 한 번도 없었으면, 완료 시점의 최종 텍스트로 보정
-            if yielded == 0:
-                final = (
-                    getattr(event, "output_text", None)
-                    or data.get("output_text")
-                )
-                if isinstance(final, str) and final:
+        for event in events_iter:
+            etype = getattr(event, "type", "") or getattr(event, "event", "")
+            data = getattr(event, "data", {}) or {}
+
+            # 텍스트 조각 델타
+            if "response.output_text.delta" in etype or "response.refusal.delta" in etype:
+                piece = getattr(event, "delta", None) or data.get("delta") or ""
+                if piece:
                     yielded += 1
-                    yield final
+                    yield piece
 
-            # (선택) usage 로깅
-            with contextlib.suppress(Exception):
-                usage = getattr(event, "usage", None) or data.get("usage")
-                if usage:
-                    logger.info("LLM: responses usage=%s", usage)
-            break
+            # 완료 이벤트: 델타가 0회면 최종 output_text로 보정
+            elif "response.completed" in etype:
+                if yielded == 0:
+                    final = getattr(event, "output_text", None) or data.get("output_text")
+                    if isinstance(final, str) and final:
+                        yielded += 1
+                        yield final
+                # (선택) usage 로깅
+                try:
+                    usage = getattr(event, "usage", None) or data.get("usage")
+                    if usage:
+                        logger.info("LLM: responses usage=%s", usage)
+                except Exception:
+                    pass
+                break
 
-        elif "response.error" in etype:
-            raise RuntimeError(str(data) or "responses_stream_error")
+            elif "response.error" in etype:
+                # 스트림 내부 에러 surfaced
+                raise RuntimeError(str(data) or "responses_stream_error")
 
     logger.info("LLM: responses stream finished yielded=%d", yielded)
+
 
 
 

@@ -4,6 +4,7 @@ from uuid import UUID
 import os
 from datetime import datetime
 from app.models.emotion import EmotionStep
+from sqlalchemy import or_
 
 SESSION_MAX_TURNS = int(os.getenv("SESSION_MAX_TURNS", "20"))
 TURNS_BEFORE_END = int(os.getenv("ACTIVITY_TURNS_BEFORE_END", "2"))  # 예: 종료 2턴 전=18턴
@@ -15,9 +16,13 @@ def _turn_count(db: Session, session_id: UUID) -> int:
         select(func.count(EmotionStep.step_id)).where(
             EmotionStep.session_id == session_id,
             EmotionStep.step_type != "system",
-            EmotionStep.insight_tag != FLAG_TAG,
+            or_(
+                EmotionStep.insight_tag.is_(None),     # NULL 포함
+                EmotionStep.insight_tag != FLAG_TAG,
+            ),
         )
     ).one())
+
 
 def _already_fired(db: Session, session_id: UUID) -> bool:
     return db.exec(select(EmotionStep.step_id).where(

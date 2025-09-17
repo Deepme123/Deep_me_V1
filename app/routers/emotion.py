@@ -19,10 +19,12 @@ from app.services.convo_policy import (
     is_activity_turn,
     is_closing_turn,
     mark_activity_injected,
+    _turn_count,
+    SESSION_MAX_TURNS,
 )
 
-router = APIRouter(prefix="/emotion", tags=["Emotion"])
 
+router = APIRouter(prefix="/emotion", tags=["Emotion"])
 
 @router.get("/sessions", response_model=list[EmotionSessionRead])
 def list_sessions(
@@ -101,6 +103,15 @@ def generate_emotion_step(
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
 
+    # 🔒 한도 초과 가드 (LLM 호출 전에 차단)
+    current_turns = _turn_count(db, input_data.session_id)
+    if current_turns >= SESSION_MAX_TURNS:
+        if not sess.ended_at:
+            sess.ended_at = datetime.utcnow()
+            db.add(sess)
+            db.commit()
+        raise HTTPException(status_code=409, detail="대화 세션이 종료되었어. 새 세션을 시작해줘.")
+
     # 시스템 프롬프트 조립
     system_prompt = get_system_prompt()
     activity_turn = is_activity_turn(input_data.session_id, db)
@@ -128,14 +139,14 @@ def generate_emotion_step(
         .order_by(EmotionStep.step_order)
     ).all()
 
-    # LLM 응답 생성(최근 스텝을 llm_service로 전달)
+    # LLM 응답 생성
     response = generate_noa_response(
         input_data=input_data,
         system_prompt=system_prompt,
-        recent_steps=recent_all,  # llm_service에서 역할 보존 메시지로 빌드
+        recent_steps=recent_all,
     )
 
-    # 스텝 저장(클라이언트 step_order 불신, 서버에서 다음 번호 부여)
+    # 스텝 저장(서버에서 step_order 부여)
     next_order = (recent_all[-1].step_order + 1) if recent_all else 1
     new_step = EmotionStep(
         session_id=input_data.session_id,
@@ -156,3 +167,4 @@ def generate_emotion_step(
     db.commit()
     db.refresh(new_step)
     return new_step
+

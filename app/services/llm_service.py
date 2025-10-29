@@ -169,7 +169,8 @@ def _responses_build_input(messages: list[dict]) -> list[dict]:
 def _responses_stream(client: OpenAI, *, model: str, inputs: list[dict]):
     """
     Responses API 스트리밍을 텍스트 조각(generator)으로 변환.
-    SDK 버전 차이를 고려해 보수적으로 처리.
+    - 출력 텍스트 델타(response.output_text.delta)만 사용자에게 전송
+    - redaction/annotation 계열 이벤트는 무시
     """
     try:
         with client.responses.stream(
@@ -181,17 +182,24 @@ def _responses_stream(client: OpenAI, *, model: str, inputs: list[dict]):
         ) as stream:
             for event in stream:
                 etype = getattr(event, "type", "")
-                # 공식 샘플: 'response.output_text.delta' 이벤트에 event.delta 존재
-                if etype.endswith(".delta"):
+                # ✅ 오직 모델 출력 텍스트 델타만 전송
+                if etype == "response.output_text.delta":
                     raw = getattr(event, "delta", None)
                     if not raw:
                         continue
                     text = raw if isinstance(raw, str) else str(raw)
                     if text:
                         yield text
+                # ❌ redaction/annotation 류는 사용자에게 노출하지 않음
+                elif etype.startswith("response.redaction"):
+                    logger.warning("responses.stream: redaction delta skipped")
+                    continue
                 elif etype == "response.error":
                     err = getattr(event, "error", None)
                     raise RuntimeError(f"responses.error: {err}")
+                else:
+                    # 기타 이벤트는 필요 시 디버그만
+                    logger.debug("responses.stream: skip event type=%s", etype)
 
             # 마무리(일부 SDK는 final_response 프로퍼티/메서드 보유)
             try:

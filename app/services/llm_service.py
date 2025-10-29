@@ -90,16 +90,16 @@ def _safe_chat_create(client: OpenAI, *, model: str, messages: list[dict], strea
     stream_opts = {"stream_options": {"include_usage": True}} if stream else {}
     attempts = [
         dict(model=model, messages=messages, stream=stream,
-            temperature=TEMPERATURE, top_p=TOP_P,
+             temperature=TEMPERATURE, top_p=TOP_P,
              max_completion_tokens=MAX_TOKENS, **stream_opts),
         dict(model=model, messages=messages, stream=stream,
-            temperature=TEMPERATURE,
+             temperature=TEMPERATURE,
              max_completion_tokens=MAX_TOKENS, **stream_opts),
         dict(model=model, messages=messages, stream=stream,
-            temperature=TEMPERATURE, top_p=TOP_P,
+             temperature=TEMPERATURE, top_p=TOP_P,
              max_tokens=MAX_TOKENS, **stream_opts),
         dict(model=model, messages=messages, stream=stream,
-            temperature=TEMPERATURE,
+             temperature=TEMPERATURE,
              max_tokens=MAX_TOKENS, **stream_opts),
         dict(model=model, messages=messages, stream=stream, **stream_opts),
     ]
@@ -118,7 +118,8 @@ def _safe_chat_create(client: OpenAI, *, model: str, messages: list[dict], strea
     if last_err:
         raise last_err
 
-# ===== Parse helpers (ADD) =====
+
+# ===== Parse helpers =====
 def _extract_text_from_chat_completion(resp) -> str:
     """chat.completions non-stream 응답에서 텍스트만 안전하게 추출"""
     try:
@@ -151,7 +152,7 @@ def _extract_text_from_stream_event(event) -> str:
     return ""
 
 
-# ===== Responses helpers (ADD) =====
+# ===== Responses helpers =====
 def _responses_build_input(messages: list[dict]) -> list[dict]:
     """
     Responses API 입력 형태로 messages 변환.
@@ -182,9 +183,12 @@ def _responses_stream(client: OpenAI, *, model: str, inputs: list[dict]):
                 etype = getattr(event, "type", "")
                 # 공식 샘플: 'response.output_text.delta' 이벤트에 event.delta 존재
                 if etype.endswith(".delta"):
-                    piece = getattr(event, "delta", None)
-                    if piece:
-                        yield piece
+                    raw = getattr(event, "delta", None)
+                    if not raw:
+                        continue
+                    text = raw if isinstance(raw, str) else str(raw)
+                    if text:
+                        yield text
                 elif etype == "response.error":
                     err = getattr(event, "error", None)
                     raise RuntimeError(f"responses.error: {err}")
@@ -204,7 +208,8 @@ def _responses_stream(client: OpenAI, *, model: str, inputs: list[dict]):
         logger.exception("responses.stream: unexpected error")
         raise
 
-# Add a non-stream fallback that tries the primary model then backups.
+
+# ===== Non-stream fallback =====
 def _fallback_non_stream_with_backups(client: OpenAI, messages: list[dict]) -> str:
     """
     Non-stream fallback: try the configured MODEL first, then each model in
@@ -230,9 +235,6 @@ def _fallback_non_stream_with_backups(client: OpenAI, messages: list[dict]) -> s
 
     return ""
 
-
-# ===== Responses & Stream helpers =====
-# (생략된 함수들 그대로 유지 — _extract_text_from_chat_completion, _responses_stream 등)
 
 # ===== Public API =====
 async def stream_noa_response(*, user_input, session, recent_steps, system_prompt):
@@ -318,88 +320,3 @@ def generate_noa_response(*, user_input: str, recent_steps, system_prompt: str) 
             logger.exception("generate_noa_response: backup failed: %s", m)
 
     return ""
-
-# ===== Responses & Stream helpers (ADD) =====
-def _extract_text_from_chat_completion(resp) -> str:
-    """chat.completions non-stream 응답에서 텍스트만 안전 추출"""
-    try:
-        choices = getattr(resp, "choices", None) or []
-        if choices:
-            msg = getattr(choices[0], "message", None)
-            if msg:
-                return (getattr(msg, "content", "") or "")
-            # 일부 SDK는 text 필드만 채워질 수 있음
-            txt = getattr(choices[0], "text", None)
-            if txt:
-                return txt or ""
-    except Exception:
-        logger.exception("_extract_text_from_chat_completion: parse failed")
-    return ""
-
-
-def _extract_text_from_stream_event(event) -> str:
-    """chat.completions 스트림 청크에서 텍스트 델타만 추출"""
-    try:
-        choices = getattr(event, "choices", None) or []
-        if choices:
-            delta = getattr(choices[0], "delta", None)
-            if delta:
-                return getattr(delta, "content", "") or ""
-            # 일부 SDK/모델은 text로 올 수도 있음
-            return getattr(choices[0], "text", "") or ""
-    except Exception:
-        logger.exception("_extract_text_from_stream_event: parse failed")
-    return ""
-
-
-def _responses_build_input(messages: list[dict]) -> list[dict]:
-    """
-    Responses API 입력 형태로 messages 변환.
-    최신 SDK는 input=[{role, content}, ...] 를 허용.
-    """
-    out: list[dict] = []
-    for m in messages:
-        role = m.get("role") or "user"
-        content = m.get("content") or ""
-        out.append({"role": role, "content": content})
-    return out
-
-
-def _responses_stream(client: OpenAI, *, model: str, inputs: list[dict]):
-    """
-    Responses API 스트리밍을 텍스트 조각(generator)으로 변환.
-    SDK/버전 차이를 고려해 보수적으로 처리.
-    """
-    try:
-        with client.responses.stream(
-            model=model,
-            input=inputs,
-            temperature=TEMPERATURE,
-            top_p=TOP_P,
-            max_output_tokens=MAX_TOKENS,
-        ) as stream:
-            for event in stream:
-                etype = getattr(event, "type", "")
-                # 공식 샘플: 'response.output_text.delta' 유형에서 event.delta 존재
-                if etype.endswith(".delta"):
-                    piece = getattr(event, "delta", None)
-                    if piece:
-                        yield piece
-                elif etype == "response.error":
-                    err = getattr(event, "error", None)
-                    raise RuntimeError(f"responses.error: {err}")
-
-            # 일부 SDK는 종료 시 final_response 접근자/메서드를 제공
-            try:
-                fr = getattr(stream, "final_response", None)
-                if callable(fr):
-                    fr()
-            except Exception:
-                pass
-
-    except BadRequestError as e:
-        _log_bad_request("responses.stream", e)
-        raise
-    except Exception:
-        logger.exception("responses.stream: unexpected error")
-        raise

@@ -138,18 +138,33 @@ def _extract_text_from_chat_completion(resp) -> str:
 
 
 def _extract_text_from_stream_event(event) -> str:
-    """chat.completions stream 청크에서 텍스트 델타만 추출"""
+    """chat.completions 스트림 청크에서 텍스트 델타만 안전 추출(dict/obj 호환)"""
     try:
         choices = getattr(event, "choices", None) or []
-        if choices:
-            delta = getattr(choices[0], "delta", None)
-            if delta:
-                return getattr(delta, "content", "") or ""
-            # 일부 SDK/모델은 text로 올 수도 있음
-            return getattr(choices[0], "text", "") or ""
+        if not choices:
+            return ""
+
+        delta = getattr(choices[0], "delta", None)
+        # 드물게 delta 대신 message 형태로 오는 SDK/모델 호환
+        if delta is None:
+            delta = getattr(choices[0], "message", None)
+
+        text = ""
+        if isinstance(delta, dict):
+            # 첫 청크가 role 전송만 할 수 있음(role='assistant') → content 없으면 빈 문자열
+            text = delta.get("content") or ""
+        else:
+            text = getattr(delta, "content", "") or ""
+
+        # 레거시/특수 구현: choices[0].text로 올 수 있음
+        if not text:
+            text = getattr(choices[0], "text", "") or ""
+
+        return text or ""
     except Exception:
         logger.exception("_extract_text_from_stream_event: parse failed")
-    return ""
+        return ""
+
 
 
 # ===== Responses helpers =====

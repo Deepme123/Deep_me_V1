@@ -6,6 +6,7 @@ from sqlmodel import SQLModel, create_engine
 from sqlalchemy.engine import url as sa_url  # make_url 사용
 from contextlib import contextmanager
 from . import SessionLocal  # 프로젝트 경로에 맞게 import
+from contextlib import contextmanager
 
 
 log = logging.getLogger(__name__)
@@ -89,3 +90,15 @@ def session_scope():
         yield db
     finally:
         db.close()
+
+@contextmanager
+def session_scope():
+    """
+    WebSocket/백그라운드 작업처럼 Depends(get_session) 못 쓰는 구간에서 쓰는 세션 컨텍스트.
+    """
+    from sqlmodel import Session
+    s = Session(engine)
+    try:
+        yield s
+    finally:
+        s.close()

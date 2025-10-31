@@ -14,6 +14,7 @@ from contextlib import suppress
 from typing import AsyncGenerator, Generator, Iterable, List, Tuple, Optional
 
 from sqlalchemy.exc import IntegrityError
+from fastapi.encoders import jsonable_encoder
 
 from app.db.session import session_scope  # ← 컨텍스트 매니저만 임포트
 from app.models.emotion import EmotionSession, EmotionStep
@@ -76,8 +77,11 @@ def _mask_preview(s: str, k: int = 80) -> str:
     return (s[:k] + "…") if len(s) > k else s
 
 async def _ws_send_safe(ws: WebSocket, data: dict, *, timeout: float | None = None) -> None:
+    payload = jsonable_encoder(data, exclude_none=True)
+
     async def _send():
-        await ws.send_json(data)
+        await ws.send_json(payload)
+
     try:
         if timeout:
             await asyncio.wait_for(_send(), timeout=timeout)
@@ -85,6 +89,7 @@ async def _ws_send_safe(ws: WebSocket, data: dict, *, timeout: float | None = No
             await _send()
     except Exception as e:
         logger.warning("WS send failed | %s | keys=%s", _safe_str(e), list(data.keys()))
+
 
 async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict | None:
     """원시 프레임 1개 수신 → JSON/dict 또는 텍스트 관용 처리."""

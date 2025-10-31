@@ -9,7 +9,6 @@ from contextlib import contextmanager
 log = logging.getLogger(__name__)
 
 def _mask(url: str) -> str:
-    """로그 출력용 마스킹 (비밀번호 숨김)"""
     if "://" not in url:
         return url
     scheme, rest = url.split("://", 1)
@@ -30,16 +29,13 @@ def _build_db_url() -> str:
     url = os.getenv("DATABASE_URL", "").strip()
     url = _strip_outer_quotes(url)
 
-    # 1) postgres:// → postgresql+psycopg2:// 로 교정
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
 
-    # 2) Render/Neon 계열이면 sslmode=require 강제
     if any(dom in url for dom in ("render.com", "neon.tech")) and "sslmode=" not in url and url:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}sslmode=require"
 
-    # 3) DATABASE_URL 비었으면 POSTGRES_*로 구성 (로컬/개발용)
     if not url:
         host = os.getenv("POSTGRES_HOST", "").strip()
         port = os.getenv("POSTGRES_PORT", "5432").strip()
@@ -50,7 +46,6 @@ def _build_db_url() -> str:
         if not (host and db and user):
             raise RuntimeError("DATABASE_URL 비어 있음 + POSTGRES_*도 부족함")
 
-        # 특수문자 있는 비번은 URL 인코딩
         if any(ch in pwd for ch in "@:/?#"):
             pwd = quote_plus(pwd)
 
@@ -59,7 +54,6 @@ def _build_db_url() -> str:
         if any(dom in host for dom in ("render.com", "neon.tech")):
             url += "?sslmode=require"
 
-    # 4) 최종 파싱 검증
     try:
         sa_url.make_url(url)
     except Exception as e:
@@ -71,10 +65,10 @@ def _build_db_url() -> str:
 DATABASE_URL = _build_db_url()
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,        # 이미 있음
-    pool_recycle=1800,         # 30분마다 재활성화
-    pool_size=5,               # 기본 5
-    max_overflow=5,            # 버스트 허용
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_size=5,
+    max_overflow=5,
 )
 
 def get_session():

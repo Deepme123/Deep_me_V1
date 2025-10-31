@@ -15,6 +15,7 @@ from typing import AsyncGenerator, Generator, Iterable, List, Tuple, Optional
 
 from sqlalchemy.exc import IntegrityError
 from fastapi.encoders import jsonable_encoder
+from urllib.parse import parse_qs
 
 from app.db.session import session_scope  # ← 컨텍스트 매니저만 임포트
 from app.models.emotion import EmotionSession, EmotionStep
@@ -92,11 +93,17 @@ async def _ws_send_safe(ws: WebSocket, data: dict, *, timeout: float | None = No
 
 
 async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict | None:
-    """원시 프레임 1개 수신 → JSON/dict 또는 텍스트 관용 처리."""
+    """
+    클라이언트 프레임을 관용적으로 수용:
+    - JSON: 그대로 dict
+    - 단어: "ping" / "open" / "close"
+    - 쿼리스트링: "type=message&text=..." 형태
+    - 그 외 일반 텍스트: 메시지 본문으로 간주 → {"type":"message","text": "..."}
+    """
     try:
         event = await asyncio.wait_for(ws.receive(), timeout=timeout) if timeout else await ws.receive()
     except asyncio.TimeoutError:
-        return {"type": MSG_PING}
+        return {"type": "ping"}  # 하트비트 대용
     except WebSocketDisconnect:
         raise
     except Exception as e:
@@ -109,26 +116,49 @@ async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict 
     text = event.get("text")
     data = event.get("bytes")
 
+    # 1) 텍스트 프레임 처리
     if text is not None:
         t = text.strip()
-        # JSON이면 파싱
-        try:
-            return json.loads(t)
-        except Exception:
-            tl = t.lower()
-            if tl == "ping":
-                return {"type": MSG_PING}
-            if tl == "open":
-                return {"type": MSG_OPEN}
-            logger.warning("WS non-JSON text ignored | %s", _mask_preview(t, 60))
-            return None
 
+        # 1-1) JSON 시도
+        if t and (t.startswith("{") or t.startswith("[")):
+            try:
+                obj = json.loads(t)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                # JSON 실패 시 아래 관용 처리로 진행
+                pass
+
+        # 1-2) 단어 명령
+        tl = t.lower()
+        if tl == "ping":
+            return {"type": "ping"}
+        if tl == "open":
+            return {"type": "open"}
+        if tl == "close":
+            return {"type": "close"}
+
+        # 1-3) 쿼리스트링 형태(type=message&text=...)
+        if "=" in t and "&" in t:
+            try:
+                q = parse_qs(t, keep_blank_values=True)
+                obj = {k: (v[0] if isinstance(v, list) and v else v) for k, v in q.items()}
+                if "type" in obj:
+                    return obj
+            except Exception:
+                pass
+
+        # 1-4) 그 외는 전부 사용자 메시지로 간주
+        return {"type": "message", "text": t}
+
+    # 2) 바이너리는 현재 미사용
     if data is not None:
-        # 현재 바이너리는 미사용
         logger.warning("WS binary frame ignored | len=%s", len(data))
         return None
 
     return None
+
 
 def _ensure_uuid(x: str | UUID | None) -> UUID | None:
     if x is None:

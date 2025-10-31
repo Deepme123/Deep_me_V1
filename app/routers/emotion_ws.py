@@ -12,11 +12,10 @@ import re
 import json
 from contextlib import suppress
 from typing import AsyncGenerator, Generator, Iterable, List, Tuple, Optional
-from app.db.session import session_scope
 
 from sqlalchemy.exc import IntegrityError
 
-from app.db.session import get_session
+from app.db.session import session_scope  # ← 컨텍스트 매니저만 임포트
 from app.models.emotion import EmotionSession, EmotionStep
 from app.schemas.emotion import (
     EmotionOpenRequest,
@@ -259,10 +258,10 @@ async def ws_emotion(ws: WebSocket):
             try:
                 from app.models.user import User  # 지연 import로 순환참조 방지
             except Exception:
-                User = None  # 타입: ignore
+                User = None  # type: ignore
 
             if uid and User:
-                with get_session() as db:
+                with session_scope() as db:
                     user_obj = db.get(User, uid)
                     if not user_obj:
                         logger.warning("bootstrap: user not found, downgrade to anonymous | user_id=%s", uid)
@@ -283,7 +282,7 @@ async def ws_emotion(ws: WebSocket):
                 db.refresh(s)
                 return s
 
-            with get_session() as db:
+            with session_scope() as db:
                 try:
                     session = create_session_with_uid(db, uid)
                 except IntegrityError as ie:
@@ -346,7 +345,7 @@ async def ws_emotion(ws: WebSocket):
                 uid = _ensure_uuid(uid)
 
                 # DB: 세션 생성 (FK 제약 대비)
-                with get_session() as db:
+                with session_scope() as db:
                     def create_session_with_uid(db, uid_val):
                         s = EmotionSession(
                             user_id=uid_val,
@@ -395,7 +394,7 @@ async def ws_emotion(ws: WebSocket):
                 logger.info("WS recv user | %s", _mask_preview(user_text, 100))
 
                 # DB: 최근 스텝들
-                with get_session() as db:
+                with session_scope() as db:
                     steps = list(
                         db.exec(
                             select(EmotionStep)
@@ -455,7 +454,7 @@ async def ws_emotion(ws: WebSocket):
 
                 # DB: 스텝 기록
                 assistant_text = "".join(assistant_chunks)
-                with get_session() as db:
+                with session_scope() as db:
                     existing = list(
                         db.exec(
                             select(EmotionStep.step_order)
@@ -506,7 +505,7 @@ async def ws_emotion(ws: WebSocket):
                     await guard_send({"type": "error", "message": f"bad close payload: {e}"})
                     continue
 
-                with get_session() as db:
+                with session_scope() as db:
                     s = db.get(EmotionSession, session_id)
                     if s:
                         s.ended_at = datetime.utcnow()
@@ -536,7 +535,7 @@ async def ws_emotion(ws: WebSocket):
                     await guard_send({"type": "error", "message": f"bad task payload: {e}"})
                     continue
 
-                with get_session() as db:
+                with session_scope() as db:
                     steps = list(
                         db.exec(
                             select(EmotionStep)

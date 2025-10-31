@@ -38,6 +38,8 @@ from app.services.convo_policy import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+ws_router = router
+__all__ = ["ws_router", "router"]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 설정/상수

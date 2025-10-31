@@ -5,9 +5,6 @@ from urllib.parse import quote_plus
 from sqlmodel import SQLModel, create_engine
 from sqlalchemy.engine import url as sa_url  # make_url 사용
 from contextlib import contextmanager
-from . import SessionLocal  # 프로젝트 경로에 맞게 import
-from contextlib import contextmanager
-
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +39,7 @@ def _build_db_url() -> str:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}sslmode=require"
 
-    # 3) DATABASE_URL이 비어 있으면 조립형 POSTGRES_*로 구성 (개발/로컬용)
+    # 3) DATABASE_URL 비었으면 POSTGRES_*로 구성 (로컬/개발용)
     if not url:
         host = os.getenv("POSTGRES_HOST", "").strip()
         port = os.getenv("POSTGRES_PORT", "5432").strip()
@@ -62,7 +59,7 @@ def _build_db_url() -> str:
         if any(dom in host for dom in ("render.com", "neon.tech")):
             url += "?sslmode=require"
 
-    # 4) 최종 파싱 검증 (여기서 실패하면 즉시 알림)
+    # 4) 최종 파싱 검증
     try:
         sa_url.make_url(url)
     except Exception as e:
@@ -72,24 +69,22 @@ def _build_db_url() -> str:
     return url
 
 DATABASE_URL = _build_db_url()
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,        # 이미 있음
+    pool_recycle=1800,         # 30분마다 재활성화
+    pool_size=5,               # 기본 5
+    max_overflow=5,            # 버스트 허용
+)
 
 def get_session():
+    """FastAPI Depends(get_session)에서 쓰는 generator."""
     from sqlmodel import Session
     with Session(engine) as s:
         yield s
 
 def create_all_tables():
     SQLModel.metadata.create_all(engine)
-
-# 새로 추가
-@contextmanager
-def session_scope():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 @contextmanager
 def session_scope():

@@ -1,5 +1,7 @@
-from typing import Optional
+# app/schemas/emotion.py
+from pydantic import BaseModel
 from uuid import UUID
+from typing import Optional, List
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict
 
@@ -60,3 +62,42 @@ class EmotionStepGenerateInput(BaseModel):
     insight_tag: Optional[str] = None
     system_prompt: Optional[str] = None
 
+
+
+# ────────── WebSocket 요청 ──────────
+class EmotionOpenRequest(BaseModel):
+    type: str = "open"
+    access_token: Optional[str] = None
+
+class EmotionMessageRequest(BaseModel):
+    type: str = "message"
+    text: str
+
+class EmotionCloseRequest(BaseModel):
+    type: str = "close"
+    emotion_label: Optional[str] = None
+    topic: Optional[str] = None
+    trigger_summary: Optional[str] = None
+    insight_summary: Optional[str] = None
+
+class TaskRecommendRequest(BaseModel):
+    type: str = "task_recommend"
+    max_items: Optional[int] = 5
+
+# ────────── WebSocket 응답 ──────────
+class EmotionOpenResponse(BaseModel):
+    type: str = "open_ok"
+    session_id: UUID
+    turns: int
+
+class EmotionMessageResponse(BaseModel):
+    type: str
+    delta: Optional[str] = None
+    message: Optional[str] = None
+
+class EmotionCloseResponse(BaseModel):
+    type: str = "close_ok"
+
+class TaskRecommendResponse(BaseModel):
+    type: str = "task_recommend_ok"
+    items: List[dict]

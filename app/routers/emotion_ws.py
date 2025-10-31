@@ -1,3 +1,4 @@
+# emotion_ws.py
 from __future__ import annotations
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -99,6 +100,8 @@ async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict 
     - 단어: "ping" / "open" / "close"
     - 쿼리스트링: "type=message&text=..." 형태
     - 그 외 일반 텍스트: 메시지 본문으로 간주 → {"type":"message","text": "..."}
+
+    timeout이 발생하면 하트비트 용도로 {"type":"ping"}을 반환한다.
     """
     try:
         event = await asyncio.wait_for(ws.receive(), timeout=timeout) if timeout else await ws.receive()
@@ -165,14 +168,21 @@ def _ensure_uuid(x: str | UUID | None) -> UUID | None:
         return None
     return UUID(str(x))
 
-def _iter_chunks(gen: Iterable[str] | AsyncGenerator[str, None]) -> AsyncGenerator[str, None] | Generator[str, None, None]:
-    """sync/async 제너레이터를 모두 지원."""
+def _iter_chunks(gen: Iterable[str] | AsyncGenerator[str, None]):
+    """
+    sync/async 제너레이터 모두를 **항상 async 제너레이터로 래핑**해서 반환.
+    이렇게 하면 호출부에서 `async for`로 일관되게 순회 가능.
+    """
     if inspect.isasyncgen(gen):
         async def _ait():
             async for x in gen:
                 yield x
         return _ait()
-    return gen
+    else:
+        async def _ait2():
+            for x in gen:
+                yield x
+        return _ait2()
 
 def _steps_to_conversation(steps: List[EmotionStep]) -> List[Tuple[str, str]]:
     """DB steps → ('user'|'assistant', text) 시퀀스."""
@@ -237,7 +247,10 @@ class LeakGuard:
 
 @router.websocket("/ws/emotion")
 async def ws_emotion(ws: WebSocket):
-    await ws.accept()
+    # 프런트가 서브프로토콜을 지정했다면 그대로 수락(없으면 None)
+    subproto = ws.headers.get("sec-websocket-protocol")
+    await ws.accept(subprotocol=subproto if subproto else None)
+
     token: str | None = None
     session_id: UUID | None = None
     leak_guard = LeakGuard()
@@ -342,14 +355,13 @@ async def ws_emotion(ws: WebSocket):
 
     try:
         while True:
-            now = loop.time()
-            if now - last_active > CFG.WS_IDLE_TIMEOUT:
-                await guard_send({"type": "timeout"})
-                break
-
+            # 수신을 먼저 기다린다(수신도 '활동'으로 간주)
             msg = await _ws_recv_safe(ws, timeout=CFG.WS_IDLE_TIMEOUT)
             if msg is None:
                 continue
+
+            # 수신 활동 시각 갱신
+            last_active = loop.time()
 
             typ = msg.get("type")
 

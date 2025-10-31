@@ -12,6 +12,7 @@ import re
 import json
 from contextlib import suppress
 from typing import AsyncGenerator, Generator, Iterable, List, Tuple, Optional
+from app.db.session import session_scope
 
 from sqlalchemy.exc import IntegrityError
 

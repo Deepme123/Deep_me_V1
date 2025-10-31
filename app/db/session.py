@@ -4,6 +4,9 @@ import logging
 from urllib.parse import quote_plus
 from sqlmodel import SQLModel, create_engine
 from sqlalchemy.engine import url as sa_url  # make_url 사용
+from contextlib import contextmanager
+from . import SessionLocal  # 프로젝트 경로에 맞게 import
+
 
 log = logging.getLogger(__name__)
 
@@ -77,3 +80,12 @@ def get_session():
 
 def create_all_tables():
     SQLModel.metadata.create_all(engine)
+
+# 새로 추가
+@contextmanager
+def session_scope():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

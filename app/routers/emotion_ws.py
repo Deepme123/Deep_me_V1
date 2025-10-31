@@ -1,4 +1,3 @@
-# app/routers/emotion_ws.py
 from __future__ import annotations
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -10,6 +9,7 @@ import logging
 import inspect
 import os
 import re
+import json
 from contextlib import suppress
 from typing import AsyncGenerator, Generator, Iterable, List, Tuple, Optional
 
@@ -85,17 +85,46 @@ async def _ws_send_safe(ws: WebSocket, data: dict, *, timeout: float | None = No
         logger.warning("WS send failed", extra={"error": _safe_str(e), "keys": list(data.keys())})
 
 async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict | None:
+    """
+    하나의 raw 프레임을 받아 JSON이면 dict로, 텍스트면 관용 처리로 매핑.
+    """
     try:
-        if timeout:
-            return await asyncio.wait_for(ws.receive_json(), timeout=timeout)
-        return await ws.receive_json()
+        event = await asyncio.wait_for(ws.receive(), timeout=timeout) if timeout else await ws.receive()
     except asyncio.TimeoutError:
         return {"type": MSG_PING}
     except WebSocketDisconnect:
         raise
     except Exception as e:
-        logger.warning("WS recv failed", extra={"error": _safe_str(e)})
+        logger.warning("WS recv() failed", extra={"error": _safe_str(e)})
         return None
+
+    msg_type = event.get("type")
+    if msg_type == "websocket.disconnect":
+        raise WebSocketDisconnect(event.get("code"))
+
+    text = event.get("text")
+    data = event.get("bytes")
+
+    if text is not None:
+        t = text.strip()
+        # JSON이면 파싱
+        try:
+            return json.loads(t)
+        except Exception:
+            tl = t.lower()
+            if tl == "ping":
+                return {"type": MSG_PING}
+            if tl == "open":
+                return {"type": MSG_OPEN}
+            logger.warning("WS non-JSON text ignored", extra={"text_preview": _mask_preview(t, 60)})
+            return None
+
+    if data is not None:
+        # 바이너리는 현재 미사용
+        logger.warning("WS binary frame ignored", extra={"len": len(data)})
+        return None
+
+    return None
 
 def _ensure_uuid(x: str | UUID | None) -> UUID | None:
     if x is None:
@@ -213,6 +242,46 @@ async def ws_emotion(ws: WebSocket):
 
     send_task = asyncio.create_task(sender())
 
+    # ── 연결 직후 쿼리스트링으로 세션 자동 오픈 (프론트가 'open'을 안 보내는 경우 대응)
+    async def _bootstrap_open_if_possible():
+        nonlocal token, session_id, sys_fp
+        qp = ws.query_params or {}
+        q_user_id = qp.get("user_id")
+        q_token = qp.get("access_token") or qp.get("token")
+        if not q_user_id and not q_token:
+            return  # 부트스트랩 대상 아님
+        try:
+            uid = _ensure_uuid(q_user_id) if q_user_id else None
+            if q_token and not uid:
+                with suppress(Exception):
+                    uid = _ensure_uuid(decode_access_token(q_token).user_id)
+            with get_session() as db:
+                session = EmotionSession(
+                    user_id=uid,
+                    started_at=datetime.utcnow(),
+                    emotion_label=None,
+                    topic=None,
+                    trigger_summary=None,
+                    insight_summary=None,
+                )
+                db.add(session)
+                db.commit()
+                db.refresh(session)
+                session_id = session.session_id
+            system_prompt = get_system_prompt()
+            sys_fp = leak_guard.fingerprint(system_prompt)
+            await _ws_send_safe(ws, EmotionOpenResponse(
+                type="open_ok",
+                session_id=session_id,
+                turns=0,
+            ).model_dump())
+            logger.info("WS bootstrap open_ok sent", extra={"session_id": str(session_id)})
+        except Exception as e:
+            logger.warning("WS bootstrap open failed", extra={"error": _safe_str(e)})
+
+    # 프론트가 핸드셰이크 메시지를 안 보내는 경우 즉시 세션 오픈 시도
+    await _bootstrap_open_if_possible()
+
     try:
         while True:
             now = loop.time()
@@ -232,6 +301,14 @@ async def ws_emotion(ws: WebSocket):
 
             # ── 세션 열기
             if typ == MSG_OPEN:
+                # 이미 부트스트랩으로 열린 상태라면 재응답
+                if session_id:
+                    await guard_send(EmotionOpenResponse(
+                        type="open_ok",
+                        session_id=session_id,
+                        turns=0,
+                    ).model_dump())
+                    continue
                 try:
                     payload = EmotionOpenRequest(**msg)
                 except Exception as e:

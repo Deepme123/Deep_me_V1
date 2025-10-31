@@ -13,6 +13,8 @@ import json
 from contextlib import suppress
 from typing import AsyncGenerator, Generator, Iterable, List, Tuple, Optional
 
+from sqlalchemy.exc import IntegrityError
+
 from app.db.session import get_session
 from app.models.emotion import EmotionSession, EmotionStep
 from app.schemas.emotion import (
@@ -82,12 +84,10 @@ async def _ws_send_safe(ws: WebSocket, data: dict, *, timeout: float | None = No
         else:
             await _send()
     except Exception as e:
-        logger.warning("WS send failed", extra={"error": _safe_str(e), "keys": list(data.keys())})
+        logger.warning("WS send failed | %s | keys=%s", _safe_str(e), list(data.keys()))
 
 async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict | None:
-    """
-    하나의 raw 프레임을 받아 JSON이면 dict로, 텍스트면 관용 처리로 매핑.
-    """
+    """원시 프레임 1개 수신 → JSON/dict 또는 텍스트 관용 처리."""
     try:
         event = await asyncio.wait_for(ws.receive(), timeout=timeout) if timeout else await ws.receive()
     except asyncio.TimeoutError:
@@ -95,11 +95,10 @@ async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict 
     except WebSocketDisconnect:
         raise
     except Exception as e:
-        logger.warning("WS recv() failed", extra={"error": _safe_str(e)})
+        logger.warning("WS recv() failed | %s", _safe_str(e))
         return None
 
-    msg_type = event.get("type")
-    if msg_type == "websocket.disconnect":
+    if event.get("type") == "websocket.disconnect":
         raise WebSocketDisconnect(event.get("code"))
 
     text = event.get("text")
@@ -116,12 +115,12 @@ async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict 
                 return {"type": MSG_PING}
             if tl == "open":
                 return {"type": MSG_OPEN}
-            logger.warning("WS non-JSON text ignored", extra={"text_preview": _mask_preview(t, 60)})
+            logger.warning("WS non-JSON text ignored | %s", _mask_preview(t, 60))
             return None
 
     if data is not None:
-        # 바이너리는 현재 미사용
-        logger.warning("WS binary frame ignored", extra={"len": len(data)})
+        # 현재 바이너리는 미사용
+        logger.warning("WS binary frame ignored | len=%s", len(data))
         return None
 
     return None
@@ -132,7 +131,7 @@ def _ensure_uuid(x: str | UUID | None) -> UUID | None:
     return UUID(str(x))
 
 def _iter_chunks(gen: Iterable[str] | AsyncGenerator[str, None]) -> AsyncGenerator[str, None] | Generator[str, None, None]:
-    """sync/async 제너레이터를 모두 지원하는 래퍼."""
+    """sync/async 제너레이터를 모두 지원."""
     if inspect.isasyncgen(gen):
         async def _ait():
             async for x in gen:
@@ -141,7 +140,7 @@ def _iter_chunks(gen: Iterable[str] | AsyncGenerator[str, None]) -> AsyncGenerat
     return gen
 
 def _steps_to_conversation(steps: List[EmotionStep]) -> List[Tuple[str, str]]:
-    """DB steps를 ('user'|'assistant', text) 시퀀스로 변환."""
+    """DB steps → ('user'|'assistant', text) 시퀀스."""
     conv: List[Tuple[str, str]] = []
     for s in steps:
         if s.step_type == "user" and s.user_input:
@@ -151,7 +150,7 @@ def _steps_to_conversation(steps: List[EmotionStep]) -> List[Tuple[str, str]]:
     return conv
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Leak guard (클래스로 캡슐화)
+# Leak guard
 
 class LeakGuard:
     _DEFAULT_MARKERS = [
@@ -190,7 +189,6 @@ class LeakGuard:
         return out
 
     def sanitize_out(self, piece: str, sys_fp: set[int]) -> str:
-        """출력 직전 필터. 누설 징후면 모드에 따라 처리."""
         if not isinstance(piece, str) or not piece:
             return ""
         if self._might_leak(piece, sys_fp):
@@ -227,47 +225,73 @@ async def ws_emotion(ws: WebSocket):
         except WebSocketDisconnect:
             pass
         except Exception as e:
-            logger.warning("WS sender loop error", extra={"error": _safe_str(e)})
+            logger.warning("WS sender loop error | %s", _safe_str(e))
 
     async def guard_send(data: dict):
         try:
             send_queue.put_nowait(data)
         except asyncio.QueueFull:
-            # ring-buffer 전략: 가장 오래된 항목 drop 후 최신 삽입
+            # ring-buffer: oldest drop
             with suppress(Exception):
                 _ = send_queue.get_nowait()
             with suppress(Exception):
                 send_queue.put_nowait(data)
-            logger.warning("WS send queue overflow; dropped oldest", extra={"keys": list(data.keys())})
+            logger.warning("WS send queue overflow; dropped oldest | keys=%s", list(data.keys()))
 
     send_task = asyncio.create_task(sender())
 
-    # ── 연결 직후 쿼리스트링으로 세션 자동 오픈 (프론트가 'open'을 안 보내는 경우 대응)
+    # ── 연결 직후 쿼리스트링으로 세션 자동 오픈
     async def _bootstrap_open_if_possible():
         nonlocal token, session_id, sys_fp
         qp = ws.query_params or {}
         q_user_id = qp.get("user_id")
         q_token = qp.get("access_token") or qp.get("token")
         if not q_user_id and not q_token:
-            return  # 부트스트랩 대상 아님
+            return
         try:
             uid = _ensure_uuid(q_user_id) if q_user_id else None
             if q_token and not uid:
                 with suppress(Exception):
                     uid = _ensure_uuid(decode_access_token(q_token).user_id)
-            with get_session() as db:
-                session = EmotionSession(
-                    user_id=uid,
+
+            # user 존재 검증 (없으면 None 처리)
+            try:
+                from app.models.user import User  # 지연 import로 순환참조 방지
+            except Exception:
+                User = None  # 타입: ignore
+
+            if uid and User:
+                with get_session() as db:
+                    user_obj = db.get(User, uid)
+                    if not user_obj:
+                        logger.warning("bootstrap: user not found, downgrade to anonymous | user_id=%s", uid)
+                        uid = None
+
+            # 세션 생성 (FK 제약 대비)
+            def create_session_with_uid(db, uid_val):
+                s = EmotionSession(
+                    user_id=uid_val,
                     started_at=datetime.utcnow(),
                     emotion_label=None,
                     topic=None,
                     trigger_summary=None,
                     insight_summary=None,
                 )
-                db.add(session)
+                db.add(s)
                 db.commit()
-                db.refresh(session)
+                db.refresh(s)
+                return s
+
+            with get_session() as db:
+                try:
+                    session = create_session_with_uid(db, uid)
+                except IntegrityError as ie:
+                    logger.warning("bootstrap commit FK failed; retrying as anonymous | %s", _safe_str(ie))
+                    db.rollback()
+                    session = create_session_with_uid(db, None)
+
                 session_id = session.session_id
+
             system_prompt = get_system_prompt()
             sys_fp = leak_guard.fingerprint(system_prompt)
             await _ws_send_safe(ws, EmotionOpenResponse(
@@ -275,11 +299,10 @@ async def ws_emotion(ws: WebSocket):
                 session_id=session_id,
                 turns=0,
             ).model_dump())
-            logger.info("WS bootstrap open_ok sent", extra={"session_id": str(session_id)})
-        except Exception as e:
-            logger.warning("WS bootstrap open failed", extra={"error": _safe_str(e)})
+            logger.info("WS bootstrap open_ok sent | session_id=%s", session_id)
+        except Exception:
+            logger.exception("WS bootstrap open failed")
 
-    # 프론트가 핸드셰이크 메시지를 안 보내는 경우 즉시 세션 오픈 시도
     await _bootstrap_open_if_possible()
 
     try:
@@ -301,7 +324,7 @@ async def ws_emotion(ws: WebSocket):
 
             # ── 세션 열기
             if typ == MSG_OPEN:
-                # 이미 부트스트랩으로 열린 상태라면 재응답
+                # 이미 열린 경우 재응답
                 if session_id:
                     await guard_send(EmotionOpenResponse(
                         type="open_ok",
@@ -321,22 +344,31 @@ async def ws_emotion(ws: WebSocket):
                     uid = decode_access_token(token).user_id if token else None
                 uid = _ensure_uuid(uid)
 
-                # DB: 세션 생성
+                # DB: 세션 생성 (FK 제약 대비)
                 with get_session() as db:
-                    session = EmotionSession(
-                        user_id=uid,
-                        started_at=datetime.utcnow(),
-                        emotion_label=None,
-                        topic=None,
-                        trigger_summary=None,
-                        insight_summary=None,
-                    )
-                    db.add(session)
-                    db.commit()
-                    db.refresh(session)
+                    def create_session_with_uid(db, uid_val):
+                        s = EmotionSession(
+                            user_id=uid_val,
+                            started_at=datetime.utcnow(),
+                            emotion_label=None,
+                            topic=None,
+                            trigger_summary=None,
+                            insight_summary=None,
+                        )
+                        db.add(s)
+                        db.commit()
+                        db.refresh(s)
+                        return s
+
+                    try:
+                        session = create_session_with_uid(db, uid)
+                    except IntegrityError as ie:
+                        logger.warning("open commit FK failed; retrying anonymous | %s", _safe_str(ie))
+                        db.rollback()
+                        session = create_session_with_uid(db, None)
+
                     session_id = session.session_id
 
-                # 시스템 프롬프트 로딩 + 누설 방지 핑거프린트
                 system_prompt = get_system_prompt()
                 sys_fp = leak_guard.fingerprint(system_prompt)
 
@@ -359,7 +391,7 @@ async def ws_emotion(ws: WebSocket):
                     continue
 
                 user_text = payload.text or ""
-                logger.info("WS recv user", extra={"preview": _mask_preview(user_text, 100)})
+                logger.info("WS recv user | %s", _mask_preview(user_text, 100))
 
                 # DB: 최근 스텝들
                 with get_session() as db:
@@ -404,10 +436,10 @@ async def ws_emotion(ws: WebSocket):
                             if not safe_piece:
                                 continue
                             assistant_chunks.append(safe_piece)
-                            logger.debug("WS delta", extra={"preview": _mask_preview(safe_piece)})
+                            logger.debug("WS delta | %s", _mask_preview(safe_piece))
                             yield safe_piece
                     except Exception as e:
-                        logger.warning("stream err", extra={"error": _safe_str(e)})
+                        logger.warning("stream err | %s", _safe_str(e))
                         raise
 
                 # 전송
@@ -423,7 +455,6 @@ async def ws_emotion(ws: WebSocket):
                 # DB: 스텝 기록
                 assistant_text = "".join(assistant_chunks)
                 with get_session() as db:
-                    # step_order: 현재 최댓값 기준 +1/+1 (동시성 안전)
                     existing = list(
                         db.exec(
                             select(EmotionStep.step_order)
@@ -534,8 +565,8 @@ async def ws_emotion(ws: WebSocket):
 
     except WebSocketDisconnect:
         pass
-    except Exception as e:
-        logger.exception("WS fatal error: %s", e)
+    except Exception:
+        logger.exception("WS fatal error")
         with suppress(Exception):
             await _ws_send_safe(ws, {"type": "error", "message": "fatal"})
     finally:

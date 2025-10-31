@@ -1,4 +1,4 @@
-# app/routers/emotion_ws.py
+# app/routers/emotion_ws.py  (완성본)
 from __future__ import annotations
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -103,6 +103,16 @@ async def _async_yield(gen, *, flush_each: bool = False):
     else:
         for x in gen:
             yield x
+
+def _steps_to_conversation(steps: list[EmotionStep]) -> list[tuple[str, str]]:
+    """DB steps를 ('user'|'assistant', text)로 변환."""
+    conv: list[tuple[str, str]] = []
+    for s in steps:
+        if s.step_type == "user" and s.user_input:
+            conv.append(("user", s.user_input))
+        elif s.step_type == "assistant" and s.gpt_response:
+            conv.append(("assistant", s.gpt_response))
+    return conv
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Leak guard helpers (수정)
@@ -284,7 +294,9 @@ async def ws_emotion(ws: WebSocket):
                 system_prompt = get_system_prompt()
                 task_prompt = get_task_prompt() if want_activity else None
 
-                # 스트리밍 호출
+                # 스트리밍 호출 + 누적 버퍼
+                assistant_chunks: list[str] = []
+
                 async def _gen():
                     try:
                         idx = 0
@@ -292,7 +304,7 @@ async def ws_emotion(ws: WebSocket):
                             stream_noa_response(
                                 system_prompt=system_prompt,
                                 task_prompt=task_prompt,
-                                conversation=[(s.role, s.text) for s in steps] + [("user", user_text)],
+                                conversation=_steps_to_conversation(steps) + [("user", user_text)],
                                 temperature=0.7,
                                 max_tokens=800,
                             )
@@ -303,6 +315,7 @@ async def ws_emotion(ws: WebSocket):
                             if not safe_piece:
                                 continue
                             logger.debug("WS send token preview: %s", _mask_preview(safe_piece))
+                            assistant_chunks.append(safe_piece)
                             yield safe_piece
                     except Exception as e:
                         logger.warning("stream err: %s", e)
@@ -319,9 +332,8 @@ async def ws_emotion(ws: WebSocket):
                     await guard_send(EmotionMessageResponse(type="message_end").model_dump())
 
                 # DB: 스텝 기록
+                assistant_text = "".join(assistant_chunks)
                 with get_session() as db:
-                    # assistant 응답은 메시지_end까지 수집된 것을 프론트에서 합쳐서 보냈다고 가정
-                    assistant_text = ""  # 프론트에서 별도 수집/전송 구조일 경우 수정
                     step_user = EmotionStep(
                         session_id=session_id,
                         step_order=len(steps) * 2 + 1,

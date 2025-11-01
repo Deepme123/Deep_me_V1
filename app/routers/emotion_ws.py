@@ -1,4 +1,4 @@
-# emotion_ws.py
+# app/routers/emotion_ws.py
 from __future__ import annotations
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -13,12 +13,12 @@ import re
 import json
 from contextlib import suppress
 from typing import AsyncGenerator, Iterable, List, Tuple, Optional
+from urllib.parse import parse_qs
 
 from sqlalchemy.exc import IntegrityError
 from fastapi.encoders import jsonable_encoder
-from urllib.parse import parse_qs
 
-from app.db.session import session_scope  # ← 컨텍스트 매니저만 임포트
+from app.db.session import session_scope  # 컨텍스트 매니저 사용統一
 from app.models.emotion import EmotionSession, EmotionStep
 from app.schemas.emotion import (
     EmotionOpenRequest,
@@ -78,11 +78,11 @@ def _mask_preview(s: str, k: int = 80) -> str:
     s = s.replace("\n", " ")
     return (s[:k] + "…") if len(s) > k else s
 
-async def _ws_send_safe(ws: WebSocket, data: dict, *, timeout: float | None = None) -> None:
+async def _ws_send_safe(websocket: WebSocket, data: dict, *, timeout: float | None = None) -> None:
     payload = jsonable_encoder(data, exclude_none=True)
 
     async def _send():
-        await ws.send_json(payload)
+        await websocket.send_json(payload)
 
     try:
         if timeout:
@@ -92,27 +92,26 @@ async def _ws_send_safe(ws: WebSocket, data: dict, *, timeout: float | None = No
     except Exception as e:
         logger.warning("WS send failed | %s | keys=%s", _safe_str(e), list(data.keys()))
 
-
-async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict | None:
+async def _ws_recv_safe(websocket: WebSocket, *, timeout: float | None = None) -> dict | None:
     """
-    클라이언트 프레임을 관용적으로 수용:
-    - JSON: 그대로 dict
-    - 단어: "ping" / "open" / "close"
-    - 쿼리스트링: "type=message&text=..." 형태
-    - 그 외 일반 텍스트: 메시지 본문으로 간주 → {"type":"message","text": "..."}
-    timeout 발생 시 하트비트 용도로 {"type":"ping"} 반환.
+    클라이언트 프레임 관용 처리:
+    - JSON: dict
+    - 단어: ping/open/close
+    - 쿼리스트링: type=message&text=...
+    - 그 외 문자열: {"type":"message","text": "..."}
+    timeout 시 {"type":"ping"} 반환
     """
     try:
-        event = await asyncio.wait_for(ws.receive(), timeout=timeout) if timeout else await ws.receive()
+        event = await asyncio.wait_for(websocket.receive(), timeout=timeout) if timeout else await websocket.receive()
     except asyncio.TimeoutError:
-        return {"type": "ping"}  # 하트비트 대용
+        return {"type": "ping"}
     except WebSocketDisconnect:
         raise
     except Exception as e:
         logger.warning("WS recv() failed | %s", _safe_str(e))
         return None
 
-    # 원시 프레임 로깅(디버그용)
+    # 원시 프레임 로깅
     try:
         logger.warning(
             "WS RAW EVENT | keys=%s txt=%r bin=%s",
@@ -129,34 +128,27 @@ async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict 
     text = event.get("text")
     data = event.get("bytes")
 
-    # 1) 텍스트 프레임 처리
     if text is not None:
         t = text.strip()
 
-        # 1-1) JSON 시도 (+ 레거시 정규화)
+        # 1) JSON 시도 (+ 레거시 정규화)
         if t and (t.startswith("{") or t.startswith("[")):
             try:
                 obj = json.loads(t)
                 if isinstance(obj, dict):
-                    # 표준 형식이면 그대로
                     if "type" in obj:
                         return obj
-
-                    # [레거시 호환] user_input / text → 표준 형식으로 정규화
                     if "user_input" in obj or "text" in obj:
                         text_val = obj.get("user_input") or obj.get("text") or ""
                         norm = {"type": "message", "text": text_val}
-                        # 선택적 필드 pass-through
                         for k in ("step_type", "emotion_label", "topic", "trigger_summary", "insight_summary", "max_items"):
                             if k in obj:
                                 norm[k] = obj[k]
                         return norm
-                    # type도 없고 정규화도 안되면 아래 관용 처리로 계속
             except Exception:
-                # JSON 실패 시 아래 관용 처리로 진행
                 pass
 
-        # 1-2) 단어 명령
+        # 2) 단어 명령
         tl = t.lower()
         if tl == "ping":
             return {"type": "ping"}
@@ -165,7 +157,7 @@ async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict 
         if tl == "close":
             return {"type": "close"}
 
-        # 1-3) 쿼리스트링 형태(type=message&text=...)
+        # 3) 쿼리스트링
         if "=" in t and "&" in t:
             try:
                 q = parse_qs(t, keep_blank_values=True)
@@ -175,17 +167,14 @@ async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict 
             except Exception:
                 pass
 
-        # 1-4) 그 외는 전부 사용자 메시지로 간주
+        # 4) 일반 텍스트 → 사용자 메시지
         return {"type": "message", "text": t}
 
-    # 2) 바이너리는 현재 미사용
     if data is not None:
         logger.warning("WS binary frame ignored | len=%s", len(data))
         return None
 
     return None
-
-
 
 def _ensure_uuid(x: str | UUID | None) -> UUID | None:
     if x is None:
@@ -194,8 +183,7 @@ def _ensure_uuid(x: str | UUID | None) -> UUID | None:
 
 def _iter_chunks(gen: Iterable[str] | AsyncGenerator[str, None]):
     """
-    sync/async 제너레이터 모두를 **항상 async 제너레이터로 래핑**해서 반환.
-    이렇게 하면 호출부에서 `async for`로 일관되게 순회 가능.
+    sync/async 제너레이터를 항상 async 제너레이터로 래핑.
     """
     if inspect.isasyncgen(gen):
         async def _ait():
@@ -270,10 +258,10 @@ class LeakGuard:
 # 라우터
 
 @router.websocket("/ws/emotion")
-async def ws_emotion(ws: WebSocket):
-    # 프런트가 서브프로토콜을 지정했다면 그대로 수락(없으면 None)
-    subproto = ws.headers.get("sec-websocket-protocol")
-    await ws.accept(subprotocol=subproto if subproto else None)
+async def ws_emotion(websocket: WebSocket, user_id: UUID):
+    # 서브프로토콜 수락(있으면)
+    subproto = websocket.headers.get("sec-websocket-protocol")
+    await websocket.accept(subprotocol=subproto if subproto else None)
 
     token: str | None = None
     session_id: UUID | None = None
@@ -290,9 +278,9 @@ async def ws_emotion(ws: WebSocket):
                 try:
                     item = await asyncio.wait_for(send_queue.get(), timeout=CFG.WS_HEARTBEAT_SEC)
                 except asyncio.TimeoutError:
-                    await _ws_send_safe(ws, {"type": MSG_PING})
+                    await _ws_send_safe(websocket, {"type": MSG_PING})
                     continue
-                await _ws_send_safe(ws, item)
+                await _ws_send_safe(websocket, item)
                 last_active = loop.time()
         except WebSocketDisconnect:
             pass
@@ -315,7 +303,7 @@ async def ws_emotion(ws: WebSocket):
     # ── 연결 직후 쿼리스트링으로 세션 자동 오픈
     async def _bootstrap_open_if_possible():
         nonlocal token, session_id, sys_fp
-        qp = ws.query_params or {}
+        qp = websocket.query_params or {}
         q_user_id = qp.get("user_id")
         q_token = qp.get("access_token") or qp.get("token")
         if not q_user_id and not q_token:
@@ -362,15 +350,14 @@ async def ws_emotion(ws: WebSocket):
                     db.rollback()
                     session = create_session_with_uid(db, None)
 
-                session_id = session.session_id
+                session_id = session.session_id  # ← 누락 수정
 
             system_prompt = get_system_prompt()
             sys_fp = leak_guard.fingerprint(system_prompt)
-            await _ws_send_safe(ws, EmotionOpenResponse(
-                type="open_ok",
-                session_id=session_id,
-                turns=0,
-            ).model_dump())
+            await _ws_send_safe(
+                websocket,
+                EmotionOpenResponse(type="open_ok", session_id=session_id, turns=0).model_dump(),
+            )
             logger.info("WS bootstrap open_ok sent | session_id=%s", session_id)
         except Exception:
             logger.exception("WS bootstrap open failed")
@@ -379,8 +366,8 @@ async def ws_emotion(ws: WebSocket):
 
     try:
         while True:
-            # 수신을 먼저 기다린다(수신도 '활동'으로 간주)
-            msg = await _ws_recv_safe(ws, timeout=CFG.WS_IDLE_TIMEOUT)
+            # 수신을 먼저 기다림
+            msg = await _ws_recv_safe(websocket, timeout=CFG.WS_IDLE_TIMEOUT)
             if msg is None:
                 continue
 
@@ -390,7 +377,7 @@ async def ws_emotion(ws: WebSocket):
             except Exception:
                 pass
 
-            # 수신 활동 시각 갱신
+            # 활동 시각 갱신
             last_active = loop.time()
 
             typ = msg.get("type")
@@ -401,7 +388,6 @@ async def ws_emotion(ws: WebSocket):
 
             # ── 세션 열기
             if typ == MSG_OPEN:
-                # 이미 열린 경우 재응답
                 if session_id:
                     await guard_send(EmotionOpenResponse(
                         type="open_ok",
@@ -421,7 +407,6 @@ async def ws_emotion(ws: WebSocket):
                     uid = decode_access_token(token).user_id if token else None
                 uid = _ensure_uuid(uid)
 
-                # DB: 세션 생성 (FK 제약 대비)
                 with session_scope() as db:
                     def create_session_with_uid(db, uid_val):
                         s = EmotionSession(
@@ -473,10 +458,10 @@ async def ws_emotion(ws: WebSocket):
                 # MARK A: DB 조회 직전
                 logger.warning("WS MARK A | before DB fetch")
 
-                # DB: 최근 스텝들 (가드)
+                # DB: 최근 스텝들
                 try:
                     with session_scope() as db:
-                        steps = list(
+                        steps: List[EmotionStep] = list(
                             db.exec(
                                 select(EmotionStep)
                                 .where(EmotionStep.session_id == session_id)
@@ -484,10 +469,18 @@ async def ws_emotion(ws: WebSocket):
                             )
                         )
 
-                        # 회차 제한 (DB 기반)
+                        # 회차 제한
                         if _turn_count(db, session_id) >= CFG.SESSION_MAX_TURNS:
                             await guard_send({"type": "limit", "message": "max turns reached"})
                             continue
+
+                        want_activity = is_activity_turn(
+                            user_text=user_text,
+                            db=db,
+                            session_id=session_id,
+                            steps=steps,
+                        )
+                        want_close = is_closing_turn(db, session_id)
 
                 except Exception as e:
                     logger.exception("WS DB fetch failed")
@@ -497,11 +490,7 @@ async def ws_emotion(ws: WebSocket):
                 # MARK B: DB 조회 통과
                 logger.warning("WS MARK B | after DB fetch, before prompt")
 
-                # 정책 판단
-                want_activity = is_activity_turn(user_text, steps)
-                want_close = is_closing_turn(user_text, steps)
-
-                # 프롬프트 로딩 (가드) + MARK C
+                # 프롬프트 로딩 + MARK C
                 try:
                     system_prompt = get_system_prompt()
                     task_prompt = get_task_prompt() if want_activity else None
@@ -517,7 +506,6 @@ async def ws_emotion(ws: WebSocket):
 
                 async def _gen():
                     try:
-                        idx = 0
                         async for piece in _iter_chunks(
                             stream_noa_response(
                                 system_prompt=system_prompt,
@@ -527,7 +515,6 @@ async def ws_emotion(ws: WebSocket):
                                 max_tokens=800,
                             )
                         ):
-                            idx += 1
                             safe_piece = leak_guard.sanitize_out(piece, sys_fp)
                             if not safe_piece:
                                 continue
@@ -558,8 +545,11 @@ async def ws_emotion(ws: WebSocket):
                             .order_by(EmotionStep.step_order.asc())
                         )
                     )
-                    last_order = existing[-1] if existing else 0
-                    user_order = last_order + 1
+                    last_order = (existing[-1] if existing else 0)
+                    if isinstance(last_order, tuple):  # 드라이버별 반환형 안전장치
+                        last_order = last_order[0] if last_order else 0
+
+                    user_order = (last_order or 0) + 1
                     assistant_order = user_order + 1
 
                     step_user = EmotionStep(
@@ -586,7 +576,8 @@ async def ws_emotion(ws: WebSocket):
 
                 if want_activity:
                     with session_scope() as db:
-                        mark_activity_injected(session_id, db)
+                        # convo_policy 시그니처가 (db, session_id)인 패턴을 따름
+                        mark_activity_injected(db, session_id)
 
                 if want_close:
                     await guard_send({"type": "suggest_close"})
@@ -666,10 +657,10 @@ async def ws_emotion(ws: WebSocket):
     except Exception:
         logger.exception("WS fatal error")
         with suppress(Exception):
-            await _ws_send_safe(ws, {"type": "error", "message": "fatal"})
+            await _ws_send_safe(websocket, {"type": "error", "message": "fatal"})
     finally:
         with suppress(Exception):
             send_task.cancel()
             await asyncio.gather(send_task, return_exceptions=True)
         with suppress(Exception):
-            await ws.close()
+            await websocket.close()

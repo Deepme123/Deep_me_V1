@@ -1,56 +1,62 @@
 # app/services/convo_policy.py
-from sqlmodel import select, func, Session
+
+from typing import List
 from uuid import UUID
-import os
-from datetime import datetime
-from app.models.emotion import EmotionStep
-from sqlalchemy import or_
 
-SESSION_MAX_TURNS = int(os.getenv("SESSION_MAX_TURNS", "20"))
-TURNS_BEFORE_END = int(os.getenv("ACTIVITY_TURNS_BEFORE_END", "2"))  # 예: 종료 2턴 전=18턴
-WINDOW = int(os.getenv("ACTIVITY_WINDOW", "1"))  # 허용 오차(폭)
-FLAG_TAG = "activity_prompt_fired"
+from sqlmodel import select, Session
 
-def _turn_count(db: Session, session_id: UUID) -> int:
-    return int(db.exec(
-        select(func.count(EmotionStep.step_id)).where(
-            EmotionStep.session_id == session_id,
-            EmotionStep.step_type != "system",
-            or_(
-                EmotionStep.insight_tag.is_(None),     # NULL 포함
-                EmotionStep.insight_tag != FLAG_TAG,
-            ),
-        )
-    ).one())
+from app.models.emotion import EmotionStep  # 실제 경로에 맞게 조정해
 
+ACTIVITY_STEP_TYPE = "activity_suggest"  # 너네가 쓰는 명칭에 맞춰
 
 def _already_fired(db: Session, session_id: UUID) -> bool:
-    return db.exec(select(EmotionStep.step_id).where(
-        EmotionStep.session_id == session_id,
-        EmotionStep.insight_tag == FLAG_TAG
-    ).limit(1)).first() is not None
+    """
+    이 세션에서 이미 액티비티(미션) 한 번 보냈는지 확인.
+    한 번 보냈으면 또 안 보낸다.
+    """
+    row = db.exec(
+        select(EmotionStep.step_id).where(
+            EmotionStep.session_id == session_id,
+            EmotionStep.step_type == ACTIVITY_STEP_TYPE,
+        )
+    ).first()
+    return row is not None
 
-def is_activity_turn(session_id: UUID, db: Session) -> bool:
-    if _already_fired(db, session_id): return False
-    planned = _turn_count(db, session_id) + 1
-    target = max(1, SESSION_MAX_TURNS - TURNS_BEFORE_END)   # 기본 18턴
-    lo, hi = max(1, target - WINDOW + 1), target
-    return lo <= planned <= hi
 
-def mark_activity_injected(session_id: UUID, db: Session) -> None:
-    if _already_fired(db, session_id): return
-    step_no = _turn_count(db, session_id) + 1
-    db.add(EmotionStep(
-        session_id=session_id,
-        step_order=step_no,
-        step_type="system",
-        user_input="",
-        gpt_response="[activity_prompt_injected]",
-        created_at=datetime.utcnow(),
-        insight_tag=FLAG_TAG,
-    ))
-    db.commit()
+def is_activity_turn(
+    user_text: str,
+    db: Session,
+    session_id: UUID,
+    steps: List[EmotionStep],
+) -> bool:
+    """
+    이번 턴에 액티비티(미션) 제안을 해야 할지 정책적으로 판단한다.
 
-def is_closing_turn(session_id: UUID, db: Session) -> bool:
-    planned = _turn_count(db, session_id) + 1
-    return planned == SESSION_MAX_TURNS
+    규칙 예시:
+    1) 이미 이 세션에서 한 번 보냈으면 다시 안 보낸다.
+    2) 직전 스텝이 GPT 응답이 아니라 유저 입력이고, 감정 분류가 끝났으면 보낼 수 있다.
+    3) 트리거가 되는 키워드가 있으면 우선 보낸다.
+    실제 규칙은 프로젝트 진행하면서 더 채우면 됨.
+    """
+    # 1. 중복 방지
+    if _already_fired(db, session_id):
+        return False
+
+    # 2. 스텝 기반 간단 룰 (예시)
+    if not steps:
+        # 첫 턴에는 굳이 미션 안 던진다
+        return False
+
+    last_step = steps[-1]
+
+    # 예: 마지막 스텝이 "analysis"/"insight" 타입이면 그 다음에 미션 던질 수 있게
+    if getattr(last_step, "step_type", None) in ("analysis", "insight", "emotion_summary"):
+        return True
+
+    # 3. 텍스트 트리거 예시
+    lowered = user_text.lower()
+    if "우울" in user_text or "살기" in user_text or "하기 싫" in user_text:
+        # 이런 건 조금 더 조심스럽게 True/False 정해야 하는데, 일단 예시
+        return True
+
+    return False

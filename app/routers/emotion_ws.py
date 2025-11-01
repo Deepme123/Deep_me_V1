@@ -12,7 +12,7 @@ import os
 import re
 import json
 from contextlib import suppress
-from typing import AsyncGenerator, Generator, Iterable, List, Tuple, Optional
+from typing import AsyncGenerator, Iterable, List, Tuple, Optional
 
 from sqlalchemy.exc import IntegrityError
 from fastapi.encoders import jsonable_encoder
@@ -100,8 +100,7 @@ async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict 
     - 단어: "ping" / "open" / "close"
     - 쿼리스트링: "type=message&text=..." 형태
     - 그 외 일반 텍스트: 메시지 본문으로 간주 → {"type":"message","text": "..."}
-
-    timeout이 발생하면 하트비트 용도로 {"type":"ping"}을 반환한다.
+    timeout 발생 시 하트비트 용도로 {"type":"ping"} 반환.
     """
     try:
         event = await asyncio.wait_for(ws.receive(), timeout=timeout) if timeout else await ws.receive()
@@ -112,6 +111,17 @@ async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict 
     except Exception as e:
         logger.warning("WS recv() failed | %s", _safe_str(e))
         return None
+
+    # 원시 프레임 로깅(디버그용)
+    try:
+        logger.warning(
+            "WS RAW EVENT | keys=%s txt=%r bin=%s",
+            list(event.keys()),
+            (event.get("text") or "")[:80],
+            bool(event.get("bytes")),
+        )
+    except Exception:
+        pass
 
     if event.get("type") == "websocket.disconnect":
         raise WebSocketDisconnect(event.get("code"))
@@ -360,6 +370,12 @@ async def ws_emotion(ws: WebSocket):
             if msg is None:
                 continue
 
+            # 파싱된 메시지 타입 로깅
+            try:
+                logger.warning("WS PARSED | %s", msg.get("type"))
+            except Exception:
+                pass
+
             # 수신 활동 시각 갱신
             last_active = loop.time()
 
@@ -440,28 +456,46 @@ async def ws_emotion(ws: WebSocket):
                 user_text = payload.text or ""
                 logger.info("WS recv user | %s", _mask_preview(user_text, 100))
 
-                # DB: 최근 스텝들
-                with session_scope() as db:
-                    steps = list(
-                        db.exec(
-                            select(EmotionStep)
-                            .where(EmotionStep.session_id == session_id)
-                            .order_by(EmotionStep.created_at.asc())
-                        )
-                    )
+                # MARK A: DB 조회 직전
+                logger.warning("WS MARK A | before DB fetch")
 
-                    # 회차 제한
-                    if _turn_count(steps) >= CFG.SESSION_MAX_TURNS:
-                        await guard_send({"type": "limit", "message": "max turns reached"})
-                        continue
+                # DB: 최근 스텝들 (가드)
+                try:
+                    with session_scope() as db:
+                        steps = list(
+                            db.exec(
+                                select(EmotionStep)
+                                .where(EmotionStep.session_id == session_id)
+                                .order_by(EmotionStep.created_at.asc())
+                            )
+                        )
+
+                        # 회차 제한
+                        if _turn_count(steps) >= CFG.SESSION_MAX_TURNS:
+                            await guard_send({"type": "limit", "message": "max turns reached"})
+                            continue
+                except Exception as e:
+                    logger.exception("WS DB fetch failed")
+                    await guard_send({"type": "error", "message": f"db_failed: {_safe_str(e)}"})
+                    continue
+
+                # MARK B: DB 조회 통과
+                logger.warning("WS MARK B | after DB fetch, before prompt")
 
                 # 정책 판단
                 want_activity = is_activity_turn(user_text, steps)
                 want_close = is_closing_turn(user_text, steps)
 
-                # 프롬프트
-                system_prompt = get_system_prompt()
-                task_prompt = get_task_prompt() if want_activity else None
+                # 프롬프트 로딩 (가드) + MARK C
+                try:
+                    system_prompt = get_system_prompt()
+                    task_prompt = get_task_prompt() if want_activity else None
+                except Exception as e:
+                    logger.exception("WS prompt load failed")
+                    await guard_send({"type": "error", "message": f"prompt_failed: {_safe_str(e)}"})
+                    continue
+
+                logger.warning("WS MARK C | after prompt load, before stream")
 
                 # 스트리밍 호출 + 누적 버퍼
                 assistant_chunks: List[str] = []

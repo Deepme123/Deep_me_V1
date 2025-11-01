@@ -1,27 +1,89 @@
 # app/services/convo_policy.py
+from __future__ import annotations
 
+import os
 from typing import List
 from uuid import UUID
+from datetime import datetime
 
-from sqlmodel import select, Session
+from sqlalchemy import func
+from sqlmodel import Session, select
 
-from app.models.emotion import EmotionStep  # 실제 경로에 맞게 조정해
+from app.models.emotion import EmotionStep
 
-ACTIVITY_STEP_TYPE = "activity_suggest"  # 너네가 쓰는 명칭에 맞춰
+# 정책 상수
+ACTIVITY_STEP_TYPE = os.getenv("ACTIVITY_STEP_TYPE", "activity_suggest")
+POLICY_MAX_TURNS = int(os.getenv("POLICY_MAX_TURNS", "20"))  # WS와 값 맞추면 좋음(SESSION_MAX_TURNS)
+
+__all__ = [
+    "is_activity_turn",
+    "is_closing_turn",
+    "mark_activity_injected",
+    "_turn_count",
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 내부 유틸
+
+def _max_step_order(db: Session, session_id: UUID) -> int:
+    """해당 세션의 마지막 step_order를 반환. 없으면 0."""
+    last = db.exec(
+        select(EmotionStep.step_order)
+        .where(EmotionStep.session_id == session_id)
+        .order_by(EmotionStep.step_order.desc())
+        .limit(1)
+    ).first()
+    if isinstance(last, tuple):
+        last = last[0] if last else 0
+    return int(last or 0)
 
 def _already_fired(db: Session, session_id: UUID) -> bool:
-    """
-    이 세션에서 이미 액티비티(미션) 한 번 보냈는지 확인.
-    한 번 보냈으면 또 안 보낸다.
-    """
-    row = db.exec(
+    """이미 액티비티 제안 플래그(step_type=ACTIVITY_STEP_TYPE)가 기록됐는지 확인."""
+    hit = db.exec(
         select(EmotionStep.step_id).where(
             EmotionStep.session_id == session_id,
             EmotionStep.step_type == ACTIVITY_STEP_TYPE,
         )
     ).first()
-    return row is not None
+    return hit is not None
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 공개 API
+
+def _turn_count(db: Session, session_id: UUID) -> int:
+    """
+    턴 수 계산. 간단히 user 스텝 수를 턴으로 본다.
+    (emotion_ws에서 user→assistant 순으로 2개씩 추가하므로 대략적인 세션 길이 판단에 충분)
+    """
+    c = db.exec(
+        select(func.count())
+        .select_from(EmotionStep)
+        .where(
+            EmotionStep.session_id == session_id,
+            EmotionStep.step_type == "user",
+        )
+    ).first()
+    if isinstance(c, tuple):
+        c = c[0]
+    return int(c or 0)
+
+def mark_activity_injected(db: Session, session_id: UUID) -> None:
+    """
+    액티비티(미션) 제안을 1회 했음을 DB에 남겨 중복 제안 방지.
+    별도의 본문 없이 정책 마커 스텝을 남긴다.
+    """
+    next_order = _max_step_order(db, session_id) + 1
+    marker = EmotionStep(
+        session_id=session_id,
+        step_order=next_order,
+        step_type=ACTIVITY_STEP_TYPE,   # "activity_suggest"
+        user_input=None,
+        gpt_response=None,
+        created_at=datetime.utcnow(),
+        insight_tag=None,
+    )
+    db.add(marker)
+    db.commit()
 
 def is_activity_turn(
     user_text: str,
@@ -30,33 +92,40 @@ def is_activity_turn(
     steps: List[EmotionStep],
 ) -> bool:
     """
-    이번 턴에 액티비티(미션) 제안을 해야 할지 정책적으로 판단한다.
-
-    규칙 예시:
-    1) 이미 이 세션에서 한 번 보냈으면 다시 안 보낸다.
-    2) 직전 스텝이 GPT 응답이 아니라 유저 입력이고, 감정 분류가 끝났으면 보낼 수 있다.
-    3) 트리거가 되는 키워드가 있으면 우선 보낸다.
-    실제 규칙은 프로젝트 진행하면서 더 채우면 됨.
+    이번 턴에 액티비티 제안을 할지 정책 판단.
+    규칙(초기 버전, 보수적):
+      1) 이미 한 번 제안했다면 False
+      2) 스텝이 전혀 없으면 False (웜업 대화 우선)
+      3) 마지막 스텝이 분석/요약류면 True (예: 'analysis', 'insight', 'emotion_summary')
+      4) 텍스트 트리거(간단 키워드): 우울/힘들/지치/무기력 등 → True
+      5) 그 외는 False
+    필요에 따라 프로젝트 규칙에 맞춰 확장하면 됨.
     """
-    # 1. 중복 방지
     if _already_fired(db, session_id):
         return False
 
-    # 2. 스텝 기반 간단 룰 (예시)
     if not steps:
-        # 첫 턴에는 굳이 미션 안 던진다
         return False
 
-    last_step = steps[-1]
-
-    # 예: 마지막 스텝이 "analysis"/"insight" 타입이면 그 다음에 미션 던질 수 있게
-    if getattr(last_step, "step_type", None) in ("analysis", "insight", "emotion_summary"):
+    last = steps[-1]
+    if getattr(last, "step_type", None) in ("analysis", "insight", "emotion_summary"):
         return True
 
-    # 3. 텍스트 트리거 예시
-    lowered = user_text.lower()
-    if "우울" in user_text or "살기" in user_text or "하기 싫" in user_text:
-        # 이런 건 조금 더 조심스럽게 True/False 정해야 하는데, 일단 예시
+    # 간단 트리거(한국어 기준 키워드 몇 가지)
+    t = (user_text or "").lower()
+    hard_triggers = (
+        "우울", "힘들", "지치", "무기력", "번아웃", "아무것도 하기 싫", "무기력해", "피곤해 죽", "버티기 힘들"
+    )
+    if any(k in user_text for k in hard_triggers):
         return True
 
     return False
+
+def is_closing_turn(db: Session, session_id: UUID) -> bool:
+    """
+    세션 종료 안내(권유)를 할지 여부.
+    기본 정책: 턴 수가 최대치에 근접하면 True.
+    - POLICY_MAX_TURNS - 1 이상이면 종료 권유 시도
+    """
+    turns = _turn_count(db, session_id)
+    return turns >= max(1, POLICY_MAX_TURNS - 1)

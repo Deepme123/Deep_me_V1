@@ -133,12 +133,25 @@ async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict 
     if text is not None:
         t = text.strip()
 
-        # 1-1) JSON 시도
+        # 1-1) JSON 시도 (+ 레거시 정규화)
         if t and (t.startswith("{") or t.startswith("[")):
             try:
                 obj = json.loads(t)
                 if isinstance(obj, dict):
-                    return obj
+                    # 표준 형식이면 그대로
+                    if "type" in obj:
+                        return obj
+
+                    # [레거시 호환] user_input / text → 표준 형식으로 정규화
+                    if "user_input" in obj or "text" in obj:
+                        text_val = obj.get("user_input") or obj.get("text") or ""
+                        norm = {"type": "message", "text": text_val}
+                        # 선택적 필드 pass-through
+                        for k in ("step_type", "emotion_label", "topic", "trigger_summary", "insight_summary", "max_items"):
+                            if k in obj:
+                                norm[k] = obj[k]
+                        return norm
+                    # type도 없고 정규화도 안되면 아래 관용 처리로 계속
             except Exception:
                 # JSON 실패 시 아래 관용 처리로 진행
                 pass
@@ -171,6 +184,7 @@ async def _ws_recv_safe(ws: WebSocket, *, timeout: float | None = None) -> dict 
         return None
 
     return None
+
 
 
 def _ensure_uuid(x: str | UUID | None) -> UUID | None:
@@ -470,10 +484,11 @@ async def ws_emotion(ws: WebSocket):
                             )
                         )
 
-                        # 회차 제한
-                        if _turn_count(steps) >= CFG.SESSION_MAX_TURNS:
+                        # 회차 제한 (DB 기반)
+                        if _turn_count(db, session_id) >= CFG.SESSION_MAX_TURNS:
                             await guard_send({"type": "limit", "message": "max turns reached"})
                             continue
+
                 except Exception as e:
                     logger.exception("WS DB fetch failed")
                     await guard_send({"type": "error", "message": f"db_failed: {_safe_str(e)}"})
@@ -570,7 +585,9 @@ async def ws_emotion(ws: WebSocket):
                     db.commit()
 
                 if want_activity:
-                    mark_activity_injected(session_id)
+                    with session_scope() as db:
+                        mark_activity_injected(session_id, db)
+
                 if want_close:
                     await guard_send({"type": "suggest_close"})
 

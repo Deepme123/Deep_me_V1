@@ -1,8 +1,9 @@
+# app/services/llm_service.py
 from __future__ import annotations
 
 import os
 import logging
-from typing import Iterable, List, Tuple, Dict, Any, Generator, Optional
+from typing import Iterable, List, Tuple, AsyncGenerator, Dict, Any, Optional
 
 from openai import OpenAI, BadRequestError
 
@@ -13,247 +14,175 @@ MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))
 TOP_P = float(os.getenv("LLM_TOP_P", "1.0"))
-TIMEOUT = float(os.getenv("LLM_TIMEOUT_SEC", "60"))  # seconds
-USE_RESPONSES = os.getenv("LLM_USE_RESPONSES", "1") == "1"  # Responses API on/off
-
-# 내부적으로 사용할 모델 패턴(대략적인 구분)
-_O_SERIES_HINTS = ("o1", "o3", "o4", "omni", "gpt-5", "gpt-5o")
+TIMEOUT = float(os.getenv("LLM_TIMEOUT_SEC", "60"))
+USE_RESPONSES = os.getenv("LLM_USE_RESPONSES", "1") == "1"  # Responses 우선 사용 여부
 
 _client: Optional[OpenAI] = None
 
 
-def _client_sync() -> OpenAI:
+def _client_singleton() -> OpenAI:
     global _client
     if _client is None:
-        _client = OpenAI()
+        _client = OpenAI(timeout=TIMEOUT)
     return _client
 
 
-# ------------------------------------------------------------------------------
-# 공통: 대화/프롬프트 빌더
-# ------------------------------------------------------------------------------
+def _is_reasoning_or_gpt5(model: str) -> bool:
+    m = (model or "").lower()
+    # GPT-5 계열 + reasoning(o1/o3/o4 reasoning 라인 포함) 가정 분기
+    return m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3") or "reason" in m
 
-def _build_chat_messages(
-    system_prompt: str,
-    task_prompt: Optional[str],
-    conversation: List[Tuple[str, str]],
-) -> List[Dict[str, str]]:
-    sys_text = system_prompt.strip()
+
+def _build_messages(system_prompt: str | None,
+                    task_prompt: str | None,
+                    conversation: List[Tuple[str, str]]) -> List[Dict[str, str]]:
+    msgs: List[Dict[str, str]] = []
+    if system_prompt:
+        msgs.append({"role": "system", "content": system_prompt})
     if task_prompt:
-        sys_text = f"{sys_text}\n\n{task_prompt.strip()}"
-
-    messages: List[Dict[str, str]] = [{"role": "system", "content": sys_text}]
+        msgs.append({"role": "system", "content": task_prompt})
     for role, text in conversation:
-        r = "user" if role not in ("user", "assistant", "system") else role
-        messages.append({"role": r, "content": text or ""})
-    return messages
+        r = "user" if role == "user" else "assistant"
+        msgs.append({"role": r, "content": text})
+    return msgs
 
 
-def _build_responses_input(
-    system_prompt: str,
-    task_prompt: Optional[str],
-    conversation: List[Tuple[str, str]],
-) -> List[Dict[str, Any]]:
-    """Responses API 입력 포맷: role + content[{type:'input_text', text:...}]"""
-    blocks: List[Dict[str, Any]] = []
-    sys_text = system_prompt.strip()
-    if task_prompt:
-        sys_text = f"{sys_text}\n\n{task_prompt.strip()}"
-    if sys_text:
-        blocks.append(
-            {
-                "role": "system",
-                "content": [{"type": "input_text", "text": sys_text}],
-            }
-        )
-    for role, text in conversation:
-        r = "user" if role not in ("user", "assistant", "system") else role
-        blocks.append(
-            {"role": r, "content": [{"type": "input_text", "text": text or ""}]}
-        )
-    return blocks
+def _normalize_for_model(params: Dict[str, Any], model: str, *, endpoint: str) -> Dict[str, Any]:
+    """
+    endpoint: 'responses' | 'chat'
+    - reasoning / gpt-5: temperature/top_p 제거
+    - tokens 파라미터 이름 정규화
+    """
+    p = dict(params)
+    if _is_reasoning_or_gpt5(model):
+        p.pop("temperature", None)
+        p.pop("top_p", None)
+
+    # max tokens 정규화
+    max_tokens = p.pop("max_tokens", None)
+    if endpoint == "responses":
+        if max_tokens is not None:
+            p["max_output_tokens"] = max_tokens
+    else:  # chat
+        if max_tokens is not None:
+            p["max_completion_tokens"] = max_tokens
+    return p
 
 
-# ------------------------------------------------------------------------------
-# Chat Completions 스트리밍
-# ------------------------------------------------------------------------------
-
-def _stream_via_chat(
+async def stream_noa_response(
     *,
-    system_prompt: str,
-    task_prompt: Optional[str],
+    system_prompt: str | None,
+    task_prompt: str | None,
     conversation: List[Tuple[str, str]],
-    temperature: float,
-    max_tokens: int,
-) -> Generator[str, None, None]:
-    client = _client_sync()
-    messages = _build_chat_messages(system_prompt, task_prompt, conversation)
-
-    # 최신 모델(o-계열, gpt-5 등)은 max_completion_tokens 권장
-    params: Dict[str, Any] = dict(
-        model=MODEL,
-        messages=messages,
-        temperature=temperature,
-        top_p=TOP_P,
-        stream=True,
-        timeout=TIMEOUT,
-    )
-
-    # 1차: max_completion_tokens로 시도
-    try:
-        params["max_completion_tokens"] = max_tokens
-        stream = client.chat.completions.create(**params)
-    except BadRequestError as e:
-        # 일부 구형 계열은 max_completion_tokens 미지원 → max_tokens로 재시도
-        logger.warning("Chat stream param retry: %s", getattr(e, "message", str(e)))
-        params.pop("max_completion_tokens", None)
-        params["max_tokens"] = max_tokens
-        stream = client.chat.completions.create(**params)
-
-    for chunk in stream:
-        try:
-            choice = chunk.choices[0]
-            delta = getattr(choice.delta, "content", None)
-            if delta:
-                yield delta
-        except Exception:
-            # 스트림 내 빈 청크/툴콜 등은 조용히 스킵
-            continue
-
-
-# ------------------------------------------------------------------------------
-# Responses API 스트리밍
-# ------------------------------------------------------------------------------
-
-def _stream_via_responses(
-    *,
-    system_prompt: str,
-    task_prompt: Optional[str],
-    conversation: List[Tuple[str, str]],
-    temperature: float,
-    max_tokens: int,
-) -> Generator[str, None, None]:
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    model: str | None = None,
+) -> AsyncGenerator[str, None]:
     """
-    NOTE:
-    - 올바른 호출은 client.responses.create(..., stream=True)
-    - 토큰 파라미터는 max_output_tokens
+    통합 스트리밍 제너레이터:
+    - 1차: Responses.stream (권장)
+    - 실패 시: Chat Completions(stream) 폴백
+    - gpt-5/Reasoning 계열 파라미터 자동 정규화
     """
-    client = _client_sync()
-    _input = _build_responses_input(system_prompt, task_prompt, conversation)
+    client = _client_singleton()
+    m = (model or MODEL)
 
-    stream = client.responses.create(
-        model=MODEL,
-        input=_input,
-        temperature=temperature,
-        top_p=TOP_P,
-        stream=True,
-        max_output_tokens=max_tokens,  # ★ Responses API는 이 이름
-        timeout=TIMEOUT,
-    )
+    messages = _build_messages(system_prompt, task_prompt, conversation)
 
-    for event in stream:
-        # 문서/SDK 기준으로 델타 이벤트는 response.output_text.delta
-        etype = getattr(event, "type", "") or getattr(event, "event", "")
-        if etype.endswith(".delta") and ("output_text" in etype or "text" in etype):
-            delta = getattr(event, "delta", None)
-            if delta:
-                yield delta
-        elif etype in ("response.error", "error"):
-            # 오류 이벤트면 예외로 끊고 Chat 경로로 폴백하게 함
-            emsg = getattr(event, "message", "responses stream error")
-            raise RuntimeError(emsg)
-        else:
-            # 다른 이벤트는 무시 (created/done 등)
-            continue
-
-
-# ------------------------------------------------------------------------------
-# 퍼블릭 API
-# ------------------------------------------------------------------------------
-
-def stream_noa_response(
-    *,
-    system_prompt: str,
-    task_prompt: Optional[str],
-    conversation: List[Tuple[str, str]],
-    temperature: float = TEMPERATURE,
-    max_tokens: int = MAX_TOKENS,
-) -> Generator[str, None, None]:
-    """
-    동기 제너레이터. 외부(WS)는 이걸 받아서 async 래핑해 사용.
-    우선 Responses를 시도하고 실패 시 Chat으로 폴백.
-    """
-    # 모델 힌트로 Responses 우선/후순위 가볍게 조정(환경변수 우선)
-    use_responses = USE_RESPONSES
-
-    # Responses 우선
-    if use_responses:
-        try:
-            yield from _stream_via_responses(
-                system_prompt=system_prompt,
-                task_prompt=task_prompt,
-                conversation=conversation,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            return
-        except Exception as e:
-            logger.warning("Responses stream failed; fallback to Chat | %s", str(e))
-
-    # Chat 폴백
-    yield from _stream_via_chat(
-        system_prompt=system_prompt,
-        task_prompt=task_prompt,
-        conversation=conversation,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-
-
-def generate_noa_response(
-    *,
-    system_prompt: str,
-    task_prompt: Optional[str],
-    conversation: List[Tuple[str, str]],
-    temperature: float = TEMPERATURE,
-    max_tokens: int = MAX_TOKENS,
-) -> str:
-    """
-    비스트리밍 동기 생성. REST 라우트 등에서 사용.
-    """
-    client = _client_sync()
-
+    # ===== 1) Responses API 시도
     if USE_RESPONSES:
         try:
-            _input = _build_responses_input(system_prompt, task_prompt, conversation)
-            resp = client.responses.create(
-                model=MODEL,
-                input=_input,
-                temperature=temperature,
-                top_p=TOP_P,
-                max_output_tokens=max_tokens,
-                timeout=TIMEOUT,
-            )
-            return getattr(resp, "output_text", "") or ""
+            base_params = {
+                "model": m,
+                # Responses는 input에 messages 배열을 그대로 줄 수 있음
+                "input": messages,
+                "temperature": (temperature if temperature is not None else TEMPERATURE),
+                "top_p": TOP_P,
+                "max_tokens": (max_tokens if max_tokens is not None else MAX_TOKENS),
+            }
+            params = _normalize_for_model(base_params, m, endpoint="responses")
+
+            with client.responses.stream(**params) as stream:
+                for event in stream:
+                    # 텍스트 델타만 흘려보냄
+                    if event.type == "response.output_text.delta":
+                        piece = event.delta or ""
+                        if piece:
+                            yield piece
+                    elif event.type == "response.error":
+                        raise BadRequestError(message=str(event.error), request=None, response=None)
+                # 완료 이벤트 대기
+                _ = stream.get_final_response()
+            return
+        except BadRequestError as e:
+            logger.warning("Responses stream failed; fallback to Chat | %s", _safe_err(e))
         except Exception as e:
-            logger.warning("Responses create failed; fallback to Chat | %s", str(e))
+            logger.warning("Responses stream exception; fallback to Chat | %s", _safe_err(e))
 
-    # Chat 경로
-    messages = _build_chat_messages(system_prompt, task_prompt, conversation)
-    params: Dict[str, Any] = dict(
-        model=MODEL,
-        messages=messages,
-        temperature=temperature,
-        top_p=TOP_P,
-        timeout=TIMEOUT,
-    )
+    # ===== 2) Chat Completions 폴백
     try:
-        params["max_completion_tokens"] = max_tokens
-        comp = _client_sync().chat.completions.create(**params)
-    except BadRequestError:
-        params.pop("max_completion_tokens", None)
-        params["max_tokens"] = max_tokens
-        comp = _client_sync().chat.completions.create(**params)
+        base_params = {
+            "model": m,
+            "messages": messages,
+            "stream": True,
+            "temperature": (temperature if temperature is not None else TEMPERATURE),
+            "top_p": TOP_P,
+            "max_tokens": (max_tokens if max_tokens is not None else MAX_TOKENS),
+        }
+        params = _normalize_for_model(base_params, m, endpoint="chat")
 
-    txt = (comp.choices[0].message.content or "") if comp.choices else ""
-    return txt
+        with client.chat.completions.stream(**params) as stream:
+            for chunk in stream:
+                try:
+                    delta = chunk.choices[0].delta
+                    if delta and delta.content:
+                        yield delta.content
+                except Exception:
+                    # 방어적 파싱
+                    pass
+            _ = stream.get_final_completion()
+        return
+    except BadRequestError as e:
+        logger.warning("Chat stream param retry: %s", _safe_err(e))
+        # 최후: temperature 제거 + tokens 제거 재시도(매우 보수적)
+        try:
+            last_params = {
+                "model": m,
+                "messages": messages,
+                "stream": True,
+            }
+            if not _is_reasoning_or_gpt5(m):
+                last_params["temperature"] = 1
+            with client.chat.completions.stream(**last_params) as stream:
+                for chunk in stream:
+                    try:
+                        delta = chunk.choices[0].delta
+                        if delta and delta.content:
+                            yield delta.content
+                    except Exception:
+                        pass
+                _ = stream.get_final_completion()
+            return
+        except Exception as e2:
+            logger.error("Chat fallback failed: %s", _safe_err(e2))
+            raise
+    except Exception as e:
+        logger.error("Chat stream failed: %s", _safe_err(e))
+        raise
+
+
+def _safe_err(e: Exception) -> str:
+    try:
+        # openai.BadRequestError는 .message/.response.json() 등 다양
+        msg = getattr(e, "message", None) or str(e)
+        detail = ""
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                j = resp.json()
+                detail = f" | {j}"
+            except Exception:
+                pass
+        return f"{msg}{detail}"
+    except Exception:
+        return str(e)

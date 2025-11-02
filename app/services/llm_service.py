@@ -15,11 +15,49 @@ TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))
 TOP_P = float(os.getenv("LLM_TOP_P", "1.0"))
 TIMEOUT = float(os.getenv("LLM_TIMEOUT_SEC", "60"))  # seconds
-USE_RESPONSES = os.getenv("LLM_USE_RESPONSES", "0") == "1"  # reserved for switching APIs
+USE_RESPONSES = os.getenv("LLM_USE_RESPONSES", "0") == "1"  # reserved
+
+# Responses-스타일(또는 신형) 모델의 관측상 prefix
+_RESPONSES_STYLE_MODELS = (
+    "gpt-5", "gpt-5o", "gpt-5-mini", "o4", "o4-mini", "o3", "omni", "omni-moderate"
+)
 
 _client = OpenAI(timeout=TIMEOUT)
 __all__ = ["stream_noa_response", "generate_noa_response"]
 
+# ----- 유틸 -----
+
+def _needs_max_completion_tokens(model: str) -> bool:
+    m = (model or "").lower()
+    return any(m.startswith(p) for p in _RESPONSES_STYLE_MODELS)
+
+def _chat_create_with_token_fallback(client: OpenAI, **base_kwargs):
+    """
+    chat.completions 호출 시 max_tokens ↔ max_completion_tokens 자동 전환.
+    - 1차: 기존 인자 그대로 시도(없으면 모델 특성에 따라 키 선택)
+    - 400에서 'Use "max_completion_tokens"' 문구가 오면 키를 바꿔서 재시도
+    """
+    kw = dict(base_kwargs)
+
+    # 키가 둘 다 없는 경우, 모델 특성 보고 기본 키 선택
+    if "max_tokens" not in kw and "max_completion_tokens" not in kw:
+        if _needs_max_completion_tokens(str(kw.get("model", ""))):
+            kw["max_completion_tokens"] = kw.pop("max_tokens", None) or MAX_TOKENS
+        else:
+            kw["max_tokens"] = kw.pop("max_completion_tokens", None) or MAX_TOKENS
+
+    try:
+        return client.chat.completions.create(**kw)
+    except BadRequestError as e:
+        msg = str(e)
+        # 서버가 직접 교정 힌트를 준 경우
+        if "max_tokens" in msg and "max_completion_tokens" in msg:
+            # max_tokens 제거하고 max_completion_tokens로 재시도
+            val = kw.pop("max_tokens", None)
+            if "max_completion_tokens" not in kw:
+                kw["max_completion_tokens"] = val or MAX_TOKENS
+            return client.chat.completions.create(**kw)
+        raise
 
 def _build_messages(
     *,
@@ -42,7 +80,6 @@ def _build_messages(
 
     return messages
 
-
 def stream_noa_response(
     *,
     system_prompt: str,
@@ -62,13 +99,15 @@ def stream_noa_response(
     )
 
     try:
-        stream = _client.chat.completions.create(
+        # 스트리밍 호출 (토큰 키 자동 전환)
+        stream = _chat_create_with_token_fallback(
+            _client,
             model=MODEL,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
             top_p=TOP_P,
             stream=True,
+            max_tokens=max_tokens,  # 필요 시 헬퍼가 max_completion_tokens로 바꿔줌
         )
 
         for chunk in stream:
@@ -87,13 +126,15 @@ def stream_noa_response(
     except BadRequestError as e:
         logger.warning("OpenAI BadRequestError (fallback to non-stream)", extra={"error": str(e)})
         try:
-            resp = _client.chat.completions.create(
+            # 폴백(비스트리밍)도 동일 헬퍼 사용
+            resp = _chat_create_with_token_fallback(
+                _client,
                 model=MODEL,
                 messages=messages,
                 temperature=temperature,
-                max_tokens=max_tokens,
                 top_p=TOP_P,
                 stream=False,
+                max_tokens=max_tokens,
             )
             text = resp.choices[0].message.content or ""
             if text:
@@ -104,7 +145,6 @@ def stream_noa_response(
     except Exception as e:
         logger.error("OpenAI stream error", extra={"error": str(e)})
         raise
-
 
 def generate_noa_response(
     *,

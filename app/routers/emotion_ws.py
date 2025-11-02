@@ -350,7 +350,7 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                     db.rollback()
                     session = create_session_with_uid(db, None)
 
-                session_id = session.session_id  # ← 누락 수정
+                session_id = session.session_id  # ← 세션 아이디 보관
 
             system_prompt = get_system_prompt()
             sys_fp = leak_guard.fingerprint(system_prompt)
@@ -552,12 +552,13 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                     user_order = (last_order or 0) + 1
                     assistant_order = user_order + 1
 
+                    # ★ user 스텝은 gpt_response를 빈 문자열로 저장 (NOT NULL 대응)
                     step_user = EmotionStep(
                         session_id=session_id,
                         step_order=user_order,
                         step_type="user",
                         user_input=user_text,
-                        gpt_response=None,
+                        gpt_response="",  # ← None 금지
                         created_at=datetime.utcnow(),
                         insight_tag=None,
                     )
@@ -566,7 +567,7 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                         step_order=assistant_order,
                         step_type="assistant",
                         user_input=None,
-                        gpt_response=assistant_text,
+                        gpt_response=assistant_text or "",
                         created_at=datetime.utcnow(),
                         insight_tag=None,
                     )

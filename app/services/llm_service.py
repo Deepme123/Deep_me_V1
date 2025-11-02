@@ -198,3 +198,30 @@ def stream_noa_response(
     except Exception as e:
         logger.error("Chat stream error: %s", e)
         raise
+
+# --- Back-compat wrapper for legacy imports ---
+def generate_noa_response(
+    system_prompt: str,
+    task_prompt: str | None,
+    conversation,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    """
+    호환성 유지용: 예전 sync 함수 시그니처를 그대로 받아
+    내부의 stream 제너레이터를 모두 이어붙여 문자열로 반환한다.
+    - GPT-5 계열은 temperature 미지원이므로 내부에서 무시될 수 있음.
+    - Responses API는 max_output_tokens, Chat은 max_completion_tokens를 사용 (내부 분기).
+    """
+    try:
+        chunks = stream_noa_response(
+            system_prompt=system_prompt,
+            task_prompt=task_prompt,
+            conversation=conversation,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return "".join(chunks)
+    except Exception:
+        logger.exception("generate_noa_response failed; returning empty string")
+        return ""

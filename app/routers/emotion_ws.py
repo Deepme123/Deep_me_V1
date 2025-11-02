@@ -487,13 +487,14 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                         user_order = last_order + 1
                         assistant_order = user_order + 1
 
-                        # ① 유저 입력 먼저 저장/커밋 (gpt_response=None)
+                        # ① 유저 입력 먼저 저장/커밋
+                        #    ※ 현재 DB는 gpt_response NOT NULL 이므로 빈 문자열로 저장
                         step_user = EmotionStep(
                             session_id=session_id,
                             step_order=user_order,
                             step_type="user",
                             user_input=user_text,
-                            gpt_response=None,
+                            gpt_response="",  # <<< 핵심: None 대신 ""
                             created_at=datetime.utcnow(),
                             insight_tag=None,
                         )

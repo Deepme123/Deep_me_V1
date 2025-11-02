@@ -13,14 +13,21 @@ from app.models.emotion import EmotionStep
 
 # 정책 상수
 ACTIVITY_STEP_TYPE = os.getenv("ACTIVITY_STEP_TYPE", "activity_suggest")
-POLICY_MAX_TURNS = int(os.getenv("POLICY_MAX_TURNS", "20"))  # WS와 값 맞추면 좋음(SESSION_MAX_TURNS)
+# 정책 상수 (단일 소스: POLICY_MAX_TURNS, 하위 호환: SESSION_MAX_TURNS)
+POLICY_MAX_TURNS = int(
+    os.getenv("POLICY_MAX_TURNS") or os.getenv("SESSION_MAX_TURNS", "20")
+)
+SESSION_MAX_TURNS = POLICY_MAX_TURNS
 
 __all__ = [
     "is_activity_turn",
     "is_closing_turn",
     "mark_activity_injected",
     "_turn_count",
+    "POLICY_MAX_TURNS",
+    "SESSION_MAX_TURNS",  # ← 내보내기 추가
 ]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 내부 유틸
@@ -94,11 +101,11 @@ def is_activity_turn(
     """
     이번 턴에 액티비티 제안을 할지 정책 판단.
     규칙(초기 버전, 보수적):
-      1) 이미 한 번 제안했다면 False
-      2) 스텝이 전혀 없으면 False (웜업 대화 우선)
-      3) 마지막 스텝이 분석/요약류면 True (예: 'analysis', 'insight', 'emotion_summary')
-      4) 텍스트 트리거(간단 키워드): 우울/힘들/지치/무기력 등 → True
-      5) 그 외는 False
+        1) 이미 한 번 제안했다면 False
+        2) 스텝이 전혀 없으면 False (웜업 대화 우선)
+        3) 마지막 스텝이 분석/요약류면 True (예: 'analysis', 'insight', 'emotion_summary')
+        4) 텍스트 트리거(간단 키워드): 우울/힘들/지치/무기력 등 → True
+        5) 그 외는 False
     필요에 따라 프로젝트 규칙에 맞춰 확장하면 됨.
     """
     if _already_fired(db, session_id):
@@ -116,7 +123,7 @@ def is_activity_turn(
     hard_triggers = (
         "우울", "힘들", "지치", "무기력", "번아웃", "아무것도 하기 싫", "무기력해", "피곤해 죽", "버티기 힘들"
     )
-    if any(k in user_text for k in hard_triggers):
+    if any(k in t for k in hard_triggers):
         return True
 
     return False

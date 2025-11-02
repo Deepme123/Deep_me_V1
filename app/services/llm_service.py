@@ -1,9 +1,8 @@
-# app/services/llm_service.py
 from __future__ import annotations
 
 import os
 import logging
-from typing import Iterable, Optional, List, Dict, Any, Tuple
+from typing import Iterable, List, Tuple, Dict, Any, Generator, Optional
 
 from openai import OpenAI, BadRequestError
 
@@ -12,157 +11,200 @@ logger = logging.getLogger(__name__)
 # ===== Config =====
 MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
-MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))  # chat.completions 전용 명칭
+MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))
 TOP_P = float(os.getenv("LLM_TOP_P", "1.0"))
 TIMEOUT = float(os.getenv("LLM_TIMEOUT_SEC", "60"))  # seconds
-USE_RESPONSES = os.getenv("LLM_USE_RESPONSES", "0") == "1"  # 강제 Responses 경로
+USE_RESPONSES = os.getenv("LLM_USE_RESPONSES", "1") == "1"  # Responses API on/off
 
-# Responses API 계열(접두 기준)
-_RESP_PREFIXES = (
-    "gpt-5", "gpt-5o", "gpt-5o-mini", "gpt-5-mini",
-    "o4", "o4-mini", "o3",
-    "omni", "omni-mini", "omni-moderate",
-)
+# 내부적으로 사용할 모델 패턴(대략적인 구분)
+_O_SERIES_HINTS = ("o1", "o3", "o4", "omni", "gpt-5", "gpt-5o")
 
-__all__ = [
-    "generate",
-    "stream_noa_response",
-    "generate_noa_response",
-]
+_client: Optional[OpenAI] = None
 
 
-def _use_responses_api(model: str) -> bool:
-    if USE_RESPONSES:
-        return True
-    return any(model.startswith(p) for p in _RESP_PREFIXES)
+def _client_sync() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI()
+    return _client
 
 
-def _mk_prompt(messages: List[Dict[str, str]]) -> str:
-    """Responses API용: role-tagged 텍스트로 합치기"""
-    lines: List[str] = []
-    for m in messages:
-        role = m.get("role", "user")
-        content = m.get("content", "") or ""
-        lines.append(f"[{role}]\n{content}\n")
-    return "\n".join(lines)
+# ------------------------------------------------------------------------------
+# 공통: 대화/프롬프트 빌더
+# ------------------------------------------------------------------------------
 
-
-def generate(
-    messages: List[Dict[str, str]],
-    stream: bool = True,
-    *,
-    temperature: Optional[float] = None,
-    max_tokens: Optional[int] = None,
-    top_p: Optional[float] = None,
-) -> Iterable[str]:
-    """
-    messages: [{"role": "system"|"user"|"assistant", "content": "..."}]
-    stream=True면 토큰 단위로 str 델타를 yield, False면 최종 한 번만 yield
-    """
-    client = OpenAI(timeout=TIMEOUT)
-
-    t = TEMPERATURE if temperature is None else float(temperature)
-    tp = TOP_P if top_p is None else float(top_p)
-    mt = MAX_TOKENS if max_tokens is None else int(max_tokens)
-
-    if _use_responses_api(MODEL):
-        # ===== Responses API 경로 =====
-        prompt_text = _mk_prompt(messages)
-        try:
-            if stream:
-                with client.responses.stream(
-                    model=MODEL,
-                    temperature=t,
-                    top_p=tp,
-                    # Responses는 max_completion_tokens 사용
-                    max_completion_tokens=mt,
-                    input={"type": "input_text", "text": prompt_text},
-                ) as s:
-                    for event in s:
-                        # 안전하게 텍스트 델타만 집계
-                        if getattr(event, "type", "") == "response.output_text.delta":
-                            yield event.delta
-                    s.close()
-            else:
-                res = client.responses.create(
-                    model=MODEL,
-                    temperature=t,
-                    top_p=tp,
-                    max_completion_tokens=mt,
-                    input={"type": "input_text", "text": prompt_text},
-                )
-                yield getattr(res, "output_text", "") or ""
-        except BadRequestError as e:
-            logger.warning("LLM BadRequest (responses): %s", e)
-            raise
-    else:
-        # ===== Chat Completions 경로 =====
-        try:
-            if stream:
-                with client.chat.completions.stream(
-                    model=MODEL,
-                    temperature=t,
-                    top_p=tp,
-                    max_tokens=mt,  # chat은 max_tokens
-                    messages=messages,
-                ) as s:
-                    for event in s:
-                        if getattr(event, "type", "") == "content.delta":
-                            yield event.delta
-                    s.close()
-            else:
-                res = client.chat.completions.create(
-                    model=MODEL,
-                    temperature=t,
-                    top_p=tp,
-                    max_tokens=mt,
-                    messages=messages,
-                )
-                text = (res.choices[0].message.content or "") if res.choices else ""
-                yield text
-        except BadRequestError as e:
-            logger.warning("LLM BadRequest (chat): %s", e)
-            raise
-
-
-# ===== 호환 래퍼 (라우터들이 기대하는 인터페이스) =====
-
-def _build_messages(
-    system_prompt: Optional[str],
+def _build_chat_messages(
+    system_prompt: str,
     task_prompt: Optional[str],
     conversation: List[Tuple[str, str]],
 ) -> List[Dict[str, str]]:
-    """
-    system → (옵션) task(system으로) → 대화(user/assistant) 순서로 메시지 구성
-    """
-    msgs: List[Dict[str, str]] = []
-    if system_prompt:
-        msgs.append({"role": "system", "content": system_prompt})
+    sys_text = system_prompt.strip()
     if task_prompt:
-        # 작업 지시도 system 롤로 붙여 일관성 유지
-        msgs.append({"role": "system", "content": task_prompt})
+        sys_text = f"{sys_text}\n\n{task_prompt.strip()}"
 
+    messages: List[Dict[str, str]] = [{"role": "system", "content": sys_text}]
     for role, text in conversation:
-        r = role if role in ("user", "assistant", "system") else "user"
-        msgs.append({"role": r, "content": text or ""})
-    return msgs
+        r = "user" if role not in ("user", "assistant", "system") else role
+        messages.append({"role": r, "content": text or ""})
+    return messages
 
+
+def _build_responses_input(
+    system_prompt: str,
+    task_prompt: Optional[str],
+    conversation: List[Tuple[str, str]],
+) -> List[Dict[str, Any]]:
+    """Responses API 입력 포맷: role + content[{type:'input_text', text:...}]"""
+    blocks: List[Dict[str, Any]] = []
+    sys_text = system_prompt.strip()
+    if task_prompt:
+        sys_text = f"{sys_text}\n\n{task_prompt.strip()}"
+    if sys_text:
+        blocks.append(
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": sys_text}],
+            }
+        )
+    for role, text in conversation:
+        r = "user" if role not in ("user", "assistant", "system") else role
+        blocks.append(
+            {"role": r, "content": [{"type": "input_text", "text": text or ""}]}
+        )
+    return blocks
+
+
+# ------------------------------------------------------------------------------
+# Chat Completions 스트리밍
+# ------------------------------------------------------------------------------
+
+def _stream_via_chat(
+    *,
+    system_prompt: str,
+    task_prompt: Optional[str],
+    conversation: List[Tuple[str, str]],
+    temperature: float,
+    max_tokens: int,
+) -> Generator[str, None, None]:
+    client = _client_sync()
+    messages = _build_chat_messages(system_prompt, task_prompt, conversation)
+
+    # 최신 모델(o-계열, gpt-5 등)은 max_completion_tokens 권장
+    params: Dict[str, Any] = dict(
+        model=MODEL,
+        messages=messages,
+        temperature=temperature,
+        top_p=TOP_P,
+        stream=True,
+        timeout=TIMEOUT,
+    )
+
+    # 1차: max_completion_tokens로 시도
+    try:
+        params["max_completion_tokens"] = max_tokens
+        stream = client.chat.completions.create(**params)
+    except BadRequestError as e:
+        # 일부 구형 계열은 max_completion_tokens 미지원 → max_tokens로 재시도
+        logger.warning("Chat stream param retry: %s", getattr(e, "message", str(e)))
+        params.pop("max_completion_tokens", None)
+        params["max_tokens"] = max_tokens
+        stream = client.chat.completions.create(**params)
+
+    for chunk in stream:
+        try:
+            choice = chunk.choices[0]
+            delta = getattr(choice.delta, "content", None)
+            if delta:
+                yield delta
+        except Exception:
+            # 스트림 내 빈 청크/툴콜 등은 조용히 스킵
+            continue
+
+
+# ------------------------------------------------------------------------------
+# Responses API 스트리밍
+# ------------------------------------------------------------------------------
+
+def _stream_via_responses(
+    *,
+    system_prompt: str,
+    task_prompt: Optional[str],
+    conversation: List[Tuple[str, str]],
+    temperature: float,
+    max_tokens: int,
+) -> Generator[str, None, None]:
+    """
+    NOTE:
+    - 올바른 호출은 client.responses.create(..., stream=True)
+    - 토큰 파라미터는 max_output_tokens
+    """
+    client = _client_sync()
+    _input = _build_responses_input(system_prompt, task_prompt, conversation)
+
+    stream = client.responses.create(
+        model=MODEL,
+        input=_input,
+        temperature=temperature,
+        top_p=TOP_P,
+        stream=True,
+        max_output_tokens=max_tokens,  # ★ Responses API는 이 이름
+        timeout=TIMEOUT,
+    )
+
+    for event in stream:
+        # 문서/SDK 기준으로 델타 이벤트는 response.output_text.delta
+        etype = getattr(event, "type", "") or getattr(event, "event", "")
+        if etype.endswith(".delta") and ("output_text" in etype or "text" in etype):
+            delta = getattr(event, "delta", None)
+            if delta:
+                yield delta
+        elif etype in ("response.error", "error"):
+            # 오류 이벤트면 예외로 끊고 Chat 경로로 폴백하게 함
+            emsg = getattr(event, "message", "responses stream error")
+            raise RuntimeError(emsg)
+        else:
+            # 다른 이벤트는 무시 (created/done 등)
+            continue
+
+
+# ------------------------------------------------------------------------------
+# 퍼블릭 API
+# ------------------------------------------------------------------------------
 
 def stream_noa_response(
     *,
-    system_prompt: Optional[str],
+    system_prompt: str,
     task_prompt: Optional[str],
     conversation: List[Tuple[str, str]],
-    temperature: float = 0.7,
-    max_tokens: int = 800,
-) -> Iterable[str]:
+    temperature: float = TEMPERATURE,
+    max_tokens: int = MAX_TOKENS,
+) -> Generator[str, None, None]:
     """
-    WS에서 쓰는 스트리밍 인터페이스 (str 델타를 yield)
+    동기 제너레이터. 외부(WS)는 이걸 받아서 async 래핑해 사용.
+    우선 Responses를 시도하고 실패 시 Chat으로 폴백.
     """
-    messages = _build_messages(system_prompt, task_prompt, conversation)
-    return generate(
-        messages,
-        stream=True,
+    # 모델 힌트로 Responses 우선/후순위 가볍게 조정(환경변수 우선)
+    use_responses = USE_RESPONSES
+
+    # Responses 우선
+    if use_responses:
+        try:
+            yield from _stream_via_responses(
+                system_prompt=system_prompt,
+                task_prompt=task_prompt,
+                conversation=conversation,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return
+        except Exception as e:
+            logger.warning("Responses stream failed; fallback to Chat | %s", str(e))
+
+    # Chat 폴백
+    yield from _stream_via_chat(
+        system_prompt=system_prompt,
+        task_prompt=task_prompt,
+        conversation=conversation,
         temperature=temperature,
         max_tokens=max_tokens,
     )
@@ -170,22 +212,48 @@ def stream_noa_response(
 
 def generate_noa_response(
     *,
-    system_prompt: Optional[str],
+    system_prompt: str,
     task_prompt: Optional[str],
     conversation: List[Tuple[str, str]],
-    temperature: float = 0.7,
-    max_tokens: int = 800,
+    temperature: float = TEMPERATURE,
+    max_tokens: int = MAX_TOKENS,
 ) -> str:
     """
-    HTTP 라우터 등에서 쓰는 비스트리밍 인터페이스 (최종 문자열 반환)
+    비스트리밍 동기 생성. REST 라우트 등에서 사용.
     """
-    messages = _build_messages(system_prompt, task_prompt, conversation)
-    # generate(stream=False)는 한 번만 yield하므로 join으로 안전 수집
-    return "".join(
-        generate(
-            messages,
-            stream=False,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+    client = _client_sync()
+
+    if USE_RESPONSES:
+        try:
+            _input = _build_responses_input(system_prompt, task_prompt, conversation)
+            resp = client.responses.create(
+                model=MODEL,
+                input=_input,
+                temperature=temperature,
+                top_p=TOP_P,
+                max_output_tokens=max_tokens,
+                timeout=TIMEOUT,
+            )
+            return getattr(resp, "output_text", "") or ""
+        except Exception as e:
+            logger.warning("Responses create failed; fallback to Chat | %s", str(e))
+
+    # Chat 경로
+    messages = _build_chat_messages(system_prompt, task_prompt, conversation)
+    params: Dict[str, Any] = dict(
+        model=MODEL,
+        messages=messages,
+        temperature=temperature,
+        top_p=TOP_P,
+        timeout=TIMEOUT,
     )
+    try:
+        params["max_completion_tokens"] = max_tokens
+        comp = _client_sync().chat.completions.create(**params)
+    except BadRequestError:
+        params.pop("max_completion_tokens", None)
+        params["max_tokens"] = max_tokens
+        comp = _client_sync().chat.completions.create(**params)
+
+    txt = (comp.choices[0].message.content or "") if comp.choices else ""
+    return txt

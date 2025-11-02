@@ -458,7 +458,7 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                 # MARK A: DB 조회 직전
                 logger.warning("WS MARK A | before DB fetch")
 
-                # DB: 최근 스텝들
+                # DB: 최근 스텝들 + 정책 판단
                 try:
                     with session_scope() as db:
                         steps: List[EmotionStep] = list(
@@ -482,8 +482,29 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                         )
                         want_close = is_closing_turn(db, session_id)
 
+                        # user/assistant step_order 계산 (선 커밋 패턴)
+                        last_order = steps[-1].step_order if steps else 0
+                        user_order = last_order + 1
+                        assistant_order = user_order + 1
+
+                        # ① 유저 입력 먼저 저장/커밋 (gpt_response=None)
+                        step_user = EmotionStep(
+                            session_id=session_id,
+                            step_order=user_order,
+                            step_type="user",
+                            user_input=user_text,
+                            gpt_response=None,
+                            created_at=datetime.utcnow(),
+                            insight_tag=None,
+                        )
+                        db.add(step_user)
+                        db.commit()
+
+                        # 이후 LLM 컨텍스트로 사용할 대화 시퀀스 구성
+                        convo = _steps_to_conversation(steps) + [("user", user_text)]
+
                 except Exception as e:
-                    logger.exception("WS DB fetch failed")
+                    logger.exception("WS DB fetch or user-step commit failed")
                     await guard_send({"type": "error", "message": f"db_failed: {_safe_str(e)}"})
                     continue
 
@@ -510,7 +531,7 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                             stream_noa_response(
                                 system_prompt=system_prompt,
                                 task_prompt=task_prompt,
-                                conversation=_steps_to_conversation(steps) + [("user", user_text)],
+                                conversation=convo,
                                 temperature=0.7,
                                 max_tokens=800,
                             )
@@ -527,57 +548,47 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
 
                 # 전송
                 await guard_send(EmotionMessageResponse(type="message_start").model_dump())
+                stream_failed = False
                 try:
                     async for piece in _gen():
                         await guard_send(EmotionMessageResponse(type="message_delta", delta=piece).model_dump())
                 except Exception:
+                    stream_failed = True
                     await guard_send({"type": "error", "message": "stream failed"})
                 finally:
                     await guard_send(EmotionMessageResponse(type="message_end").model_dump())
 
-                # DB: 스텝 기록
-                assistant_text = "".join(assistant_chunks)
-                with session_scope() as db:
-                    existing = list(
-                        db.exec(
-                            select(EmotionStep.step_order)
-                            .where(EmotionStep.session_id == session_id)
-                            .order_by(EmotionStep.step_order.asc())
+                if stream_failed:
+                    # LLM 실패 시 assistant step을 생성하지 않음
+                    continue
+
+                assistant_text = "".join(assistant_chunks).strip()
+                if not assistant_text:
+                    # 내용이 비면 저장하지 않고 종료
+                    await guard_send({"type": "error", "message": "empty_assistant_response"})
+                    continue
+
+                # ② 어시스턴트 스텝 저장/커밋
+                try:
+                    with session_scope() as db:
+                        step_assistant = EmotionStep(
+                            session_id=session_id,
+                            step_order=assistant_order,
+                            step_type="assistant",
+                            user_input=None,
+                            gpt_response=assistant_text,
+                            created_at=datetime.utcnow(),
+                            insight_tag=None,
                         )
-                    )
-                    last_order = (existing[-1] if existing else 0)
-                    if isinstance(last_order, tuple):  # 드라이버별 반환형 안전장치
-                        last_order = last_order[0] if last_order else 0
-
-                    user_order = (last_order or 0) + 1
-                    assistant_order = user_order + 1
-
-                    # ★ user 스텝은 gpt_response를 빈 문자열로 저장 (NOT NULL 대응)
-                    step_user = EmotionStep(
-                        session_id=session_id,
-                        step_order=user_order,
-                        step_type="user",
-                        user_input=user_text,
-                        gpt_response="",  # ← None 금지
-                        created_at=datetime.utcnow(),
-                        insight_tag=None,
-                    )
-                    step_assistant = EmotionStep(
-                        session_id=session_id,
-                        step_order=assistant_order,
-                        step_type="assistant",
-                        user_input=None,
-                        gpt_response=assistant_text or "",
-                        created_at=datetime.utcnow(),
-                        insight_tag=None,
-                    )
-                    db.add(step_user)
-                    db.add(step_assistant)
-                    db.commit()
+                        db.add(step_assistant)
+                        db.commit()
+                except Exception:
+                    logger.exception("WS assistant-step commit failed")
+                    await guard_send({"type": "error", "message": "server_error:assistant_step_commit"})
+                    continue
 
                 if want_activity:
                     with session_scope() as db:
-                        # convo_policy 시그니처가 (db, session_id)인 패턴을 따름
                         mark_activity_injected(db, session_id)
 
                 if want_close:

@@ -494,7 +494,7 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                             step_order=user_order,
                             step_type="user",
                             user_input=user_text,
-                            gpt_response="",  # <<< 핵심: None 대신 ""
+                            gpt_response=None,  # <<< 핵심: None 대신 ""
                             created_at=datetime.utcnow(),
                             insight_tag=None,
                         )

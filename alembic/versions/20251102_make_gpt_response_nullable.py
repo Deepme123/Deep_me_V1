@@ -1,16 +1,13 @@
-# alembic/versions/20251102_make_gpt_response_nullable.py
 from alembic import op
 import sqlalchemy as sa
 
-# 고유 리비전 ID
-revision = "20251102_make_gpt_response_nullable"
-# 여기를 직전 리비전ID로 교체
-down_revision = "<prev_revision_id>"
+revision = "20251102_make_user_input_nullable"
+down_revision = "<이전 리비전 ID로 교체>"  # alembic history로 확인
 
 def upgrade():
     op.alter_column(
         "emotionstep",
-        "gpt_response",
+        "user_input",
         existing_type=sa.Text(),
         nullable=True,
     )
@@ -18,7 +15,7 @@ def upgrade():
 def downgrade():
     op.alter_column(
         "emotionstep",
-        "gpt_response",
+        "user_input",
         existing_type=sa.Text(),
         nullable=False,
     )

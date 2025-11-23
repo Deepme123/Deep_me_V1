@@ -288,16 +288,8 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
             logger.warning("WS sender loop error | %s", _safe_str(e))
 
     async def guard_send(data: dict):
-        try:
-            send_queue.put_nowait(data)
-        except asyncio.QueueFull:
-            # ring-buffer: oldest drop
-            with suppress(Exception):
-                _ = send_queue.get_nowait()
-            with suppress(Exception):
-                send_queue.put_nowait(data)
-            logger.warning("WS send queue overflow; dropped oldest | keys=%s", list(data.keys()))
-
+        await send_queue.put(data)
+        
     send_task = asyncio.create_task(sender())
 
     # ── 연결 직후 쿼리스트링으로 세션 자동 오픈

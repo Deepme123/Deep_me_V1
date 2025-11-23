@@ -289,7 +289,7 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
 
     async def guard_send(data: dict):
         await send_queue.put(data)
-        
+
     send_task = asyncio.create_task(sender())
 
     # ── 연결 직후 쿼리스트링으로 세션 자동 오픈
@@ -580,12 +580,29 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                     await guard_send({"type": "error", "message": "server_error:assistant_step_commit"})
                     continue
 
+                await guard_send(
+                    EmotionMessageResponse(
+                        type="message",
+                        message=assistant_text,
+                    ).model_dump()
+                )
+
                 if want_activity:
                     with session_scope() as db:
                         mark_activity_injected(db, session_id)
 
                 if want_close:
                     await guard_send({"type": "suggest_close"})
+                
+                if want_activity:
+                    with session_scope() as db:
+                        items = recommend_tasks_for_session(db, session_id)
+                    await guard_send(
+                        TaskRecommendResponse(
+                            type="task_recommend_ok",
+                            items=items,
+                        ).model_dump()
+                    )
 
             # ── 세션 종료
             elif typ == MSG_CLOSE:

@@ -576,7 +576,7 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                             session_id=session_id,
                             step_order=assistant_order,
                             step_type="assistant",
-                            user_input=None,
+                            user_input="",
                             gpt_response=assistant_text,
                             created_at=datetime.utcnow(),
                             insight_tag=None,

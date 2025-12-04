@@ -16,15 +16,14 @@ from sqlmodel import Session, select
 from app.db.session import get_session
 from app.models.user import User
 from app.models.refresh_token import RefreshToken
+from app.services.auth_service import refresh_tokens
 from app.core.tokens import (
     create_access_token,
     create_refresh_token,
-    verify_refresh_token,
     new_refresh_jti,
     sha256_hex,
     set_refresh_cookie,
     clear_refresh_cookie,
-    REFRESH_COOKIE_NAME,
 )
 # 프로젝트에 사용자 인증 의존성이 있다면 사용 (예: get_current_user)
 try:
@@ -73,6 +72,13 @@ class AuthTokenModel(BaseModel):
     token_type: str = "bearer"
     expires_in: int
     user: dict
+
+class RefreshResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user_id: str
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 내부 헬퍼
@@ -350,96 +356,27 @@ def login_for_access_token(
     return _build_auth_response(user, meta["access_token"])
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Refresh (RT 회전 + 재사용 탐지)
+# Refresh Token rotation (POST /auth/refresh)
 # ──────────────────────────────────────────────────────────────────────────────
-@auth_router.post("/refresh", tags=["auth"])
+@auth_router.post("/auth/refresh", response_model=RefreshResponse, tags=["auth"])
 async def refresh_token_endpoint(
     request: Request,
     response: Response,
     db: Session = Depends(get_session),
 ):
     """
-    RT 회전:
-    1) 쿠키(권장) 또는 바디에서 RT 추출
-    2) 서명/만료 검증 → jti/sub 얻기
-    3) DB에서 jti 조회 → 이미 무효(revoked/replaced)면 재사용 탐지 → 보안 이벤트 처리
-    4) 새 AT/RT 발급, 이전 RT 무효화(replaced_by, revoked_at)
+    Refresh access token via secure RT rotation.
+    - Validates and hashes RTs server-side
+    - Detects reuse and revokes sibling tokens
+    - Rotates RT and issues short-lived access token
     """
-    # 1) 토큰 추출(쿠키 우선)
-    rt = request.cookies.get(REFRESH_COOKIE_NAME)
-    if not rt:
-        try:
-            body = await request.json()
-            if isinstance(body, dict):
-                rt = body.get("refresh_token")
-        except Exception:
-            rt = None
-    if not rt:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token missing")
-
-    # 2) 서명/만료 검증
-    try:
-        payload = verify_refresh_token(rt)
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
-
-    sub = payload.get("sub")
-    jti = payload.get("jti")
-    if not sub or not jti:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token payload")
-
-    # 3) DB 조회
-    rt_row = db.get(RefreshToken, jti)
-    if rt_row is None:
-        # DB에 기록이 없으면 이미 폐기됐거나 재사용 탐지 케이스 가능
-        clear_refresh_cookie(response)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token not recognized")
-
-    # 재사용 탐지: 이미 교체되었거나(replaced_by) 또는 revoked
-    if rt_row.revoked_at is not None or rt_row.replaced_by is not None:
-        # 간단 대응: 해당 사용자 RT 전부 무효화
-        for row in db.exec(select(RefreshToken).where(RefreshToken.user_id == rt_row.user_id)):
-            if row.revoked_at is None:
-                row.revoked_at = datetime.utcnow()
-        db.commit()
-        clear_refresh_cookie(response)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token reused")
-
-    # 토큰 원문 해시 일치 확인(유출/조작 방지)
-    if rt_row.token_hash != sha256_hex(rt):
-        clear_refresh_cookie(response)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token tampered")
-
-    # 4) 새 AT/RT 발급(회전)
-    user = db.get(User, UUID(sub))
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    new_access = create_access_token(user.user_id)
-    new_jti = new_refresh_jti()
-    new_rt, new_exp = create_refresh_token(user.user_id, new_jti)
-
-    # 이전 RT 무효화 + 체인 연결
-    rt_row.revoked_at = datetime.utcnow()
-    rt_row.replaced_by = new_jti
-
-    # 새 RT 저장
-    db.add(
-        RefreshToken(
-            jti=new_jti,
-            user_id=user.user_id,
-            token_hash=sha256_hex(new_rt),
-            expires_at=new_exp,
-            ip=request.client.host if request.client else None,
-            user_agent=request.headers.get("user-agent"),
-        )
+    data = await refresh_tokens(
+        request=request,
+        response=response,
+        db=db,
+        set_access_cookie=AUTH_SET_COOKIE_ON_POST,
+        access_cookie_secure=COOKIE_SECURE,
+        access_cookie_samesite=COOKIE_SAMESITE,
+        access_cookie_max_age=COOKIE_MAX_AGE,
     )
-    db.commit()
-
-    # 쿠키 교체
-    set_refresh_cookie(response, new_rt)
-
-    # 필요 시 AT를 쿠키로도 내려줌(선택)
-    _set_access_cookie_if_enabled(response, new_access)
-
-    return _build_auth_response(user, new_access)
+    return RefreshResponse(**data)

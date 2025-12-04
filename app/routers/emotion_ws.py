@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from sqlmodel import select
+from sqlmodel import select, Session
 from uuid import UUID
 from datetime import datetime
 import asyncio
@@ -11,8 +11,9 @@ import inspect
 import os
 import re
 import json
+import threading
 from contextlib import suppress
-from typing import AsyncGenerator, Iterable, List, Tuple, Optional
+from typing import AsyncGenerator, Iterable, List, Tuple, Optional, Callable, TypeVar, Any
 from urllib.parse import parse_qs
 
 from sqlalchemy.exc import IntegrityError
@@ -54,6 +55,7 @@ class WSConfig:
     WS_IDLE_TIMEOUT: float = float(os.getenv("WS_IDLE_TIMEOUT", "120"))
     WS_SEND_BUFFER: int = int(os.getenv("WS_SEND_BUFFER", "20"))
     WS_HEARTBEAT_SEC: float = float(os.getenv("WS_HEARTBEAT_SEC", "15"))
+    WS_HISTORY_TURNS: int = max(5, min(10, int(os.getenv("WS_HISTORY_TURNS", "8"))))
 
 CFG = WSConfig()
 
@@ -64,6 +66,8 @@ MSG_CLOSE = "close"
 MSG_TASK_RECOMMEND = "task_recommend"
 MSG_PING = "ping"
 MSG_PONG = "pong"
+
+T = TypeVar("T")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 유틸
@@ -77,6 +81,16 @@ def _safe_str(x: object) -> str:
 def _mask_preview(s: str, k: int = 80) -> str:
     s = s.replace("\n", " ")
     return (s[:k] + "…") if len(s) > k else s
+class TurnLimitReached(Exception):
+    """Raised when a session has reached the configured turn limit."""
+    pass
+
+def _run_with_session(fn: Callable[[Session], T], *args, **kwargs) -> T:
+    with session_scope() as db:
+        return fn(db, *args, **kwargs)
+
+async def _with_db(fn: Callable[[Session], T], *args, **kwargs) -> T:
+    return await asyncio.to_thread(_run_with_session, fn, *args, **kwargs)
 
 async def _ws_send_safe(websocket: WebSocket, data: dict, *, timeout: float | None = None) -> None:
     payload = jsonable_encoder(data, exclude_none=True)
@@ -192,8 +206,28 @@ def _iter_chunks(gen: Iterable[str] | AsyncGenerator[str, None]):
         return _ait()
     else:
         async def _ait2():
-            for x in gen:
-                yield x
+            loop = asyncio.get_running_loop()
+            q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+            def _worker():
+                try:
+                    for x in gen:
+                        loop.call_soon_threadsafe(q.put_nowait, ("data", x))
+                except Exception as exc:
+                    loop.call_soon_threadsafe(q.put_nowait, ("err", exc))
+                finally:
+                    loop.call_soon_threadsafe(q.put_nowait, ("done", None))
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+            while True:
+                kind, payload = await q.get()
+                if kind == "data":
+                    yield payload
+                elif kind == "err":
+                    raise payload
+                else:
+                    break
         return _ait2()
 
 def _steps_to_conversation(steps: List[EmotionStep]) -> List[Tuple[str, str]]:
@@ -205,6 +239,112 @@ def _steps_to_conversation(steps: List[EmotionStep]) -> List[Tuple[str, str]]:
         elif s.step_type == "assistant" and s.gpt_response:
             conv.append(("assistant", s.gpt_response))
     return conv
+
+def _create_emotion_session(db: Session, uid_val: UUID | None) -> EmotionSession:
+    s = EmotionSession(
+        user_id=uid_val,
+        started_at=datetime.utcnow(),
+        emotion_label=None,
+        topic=None,
+        trigger_summary=None,
+        insight_summary=None,
+    )
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return s
+
+def _prepare_message_context(db: Session, session_id: UUID, user_text: str) -> dict:
+    steps: List[EmotionStep] = list(
+        db.exec(
+            select(EmotionStep)
+            .where(EmotionStep.session_id == session_id)
+            .order_by(EmotionStep.created_at.asc())
+        )
+    )
+    # Keep only the most recent 5–10 turns to reduce LLM context size.
+    max_entries = CFG.WS_HISTORY_TURNS * 2  # user+assistant per turn
+    steps_for_convo = steps[-max_entries:] if len(steps) > max_entries else steps
+
+    if _turn_count(db, session_id) >= CFG.SESSION_MAX_TURNS:
+        raise TurnLimitReached()
+
+    want_activity = is_activity_turn(
+        user_text=user_text,
+        db=db,
+        session_id=session_id,
+        steps=steps,
+    )
+    want_close = is_closing_turn(db, session_id)
+
+    last_order = steps[-1].step_order if steps else 0
+    user_order = last_order + 1
+    assistant_order = user_order + 1
+
+    step_user = EmotionStep(
+        session_id=session_id,
+        step_order=user_order,
+        step_type="user",
+        user_input=user_text,
+        gpt_response="",
+        created_at=datetime.utcnow(),
+        insight_tag=None,
+    )
+    db.add(step_user)
+    db.commit()
+
+    convo = _steps_to_conversation(steps_for_convo) + [("user", user_text)]
+    return {
+        "want_activity": want_activity,
+        "want_close": want_close,
+        "assistant_order": assistant_order,
+        "conversation": convo,
+    }
+
+def _commit_assistant_step(db: Session, session_id: UUID, assistant_order: int, assistant_text: str) -> None:
+    step_assistant = EmotionStep(
+        session_id=session_id,
+        step_order=assistant_order,
+        step_type="assistant",
+        user_input="",
+        gpt_response=assistant_text,
+        created_at=datetime.utcnow(),
+        insight_tag=None,
+    )
+    db.add(step_assistant)
+    db.commit()
+
+def _close_session_record(db: Session, session_id: UUID, payload: EmotionCloseRequest) -> None:
+    s = db.get(EmotionSession, session_id)
+    if s:
+        s.ended_at = datetime.utcnow()
+        if payload.emotion_label:
+            s.emotion_label = payload.emotion_label
+        if payload.topic:
+            s.topic = payload.topic
+        if payload.trigger_summary:
+            s.trigger_summary = payload.trigger_summary
+        if payload.insight_summary:
+            s.insight_summary = payload.insight_summary
+        db.add(s)
+        db.commit()
+
+async def _recommend_tasks_async(session_id: UUID, max_items: int) -> List[dict]:
+    def _work() -> List[dict]:
+        with session_scope() as db:
+            sess = db.get(EmotionSession, session_id)
+            if not sess or not sess.user_id:
+                return []
+            uid = sess.user_id
+
+        tasks = recommend_tasks_from_session_core(
+            user_id=uid,
+            session_id=session_id,
+            n=max(1, max_items),
+        )
+        return jsonable_encoder(tasks, exclude_none=True) if tasks else []
+
+    return await asyncio.to_thread(_work)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Leak guard
@@ -313,36 +453,18 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                 User = None  # type: ignore
 
             if uid and User:
-                with session_scope() as db:
-                    user_obj = db.get(User, uid)
-                    if not user_obj:
-                        logger.warning("bootstrap: user not found, downgrade to anonymous | user_id=%s", uid)
-                        uid = None
+                user_exists = await _with_db(lambda db: db.get(User, uid) is not None)
+                if not user_exists:
+                    logger.warning("bootstrap: user not found, downgrade to anonymous | user_id=%s", uid)
+                    uid = None
 
-            # 세션 생성 (FK 제약 대비)
-            def create_session_with_uid(db, uid_val):
-                s = EmotionSession(
-                    user_id=uid_val,
-                    started_at=datetime.utcnow(),
-                    emotion_label=None,
-                    topic=None,
-                    trigger_summary=None,
-                    insight_summary=None,
-                )
-                db.add(s)
-                db.commit()
-                db.refresh(s)
-                return s
+            try:
+                session = await _with_db(_create_emotion_session, uid)
+            except IntegrityError as ie:
+                logger.warning("bootstrap commit FK failed; retrying as anonymous | %s", _safe_str(ie))
+                session = await _with_db(_create_emotion_session, None)
 
-            with session_scope() as db:
-                try:
-                    session = create_session_with_uid(db, uid)
-                except IntegrityError as ie:
-                    logger.warning("bootstrap commit FK failed; retrying as anonymous | %s", _safe_str(ie))
-                    db.rollback()
-                    session = create_session_with_uid(db, None)
-
-                session_id = session.session_id  # ← 세션 아이디 보관
+            session_id = session.session_id  # ← 세션 아이디 보관
 
             system_prompt = get_system_prompt()
             sys_fp = leak_guard.fingerprint(system_prompt)
@@ -399,29 +521,13 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                     uid = decode_access_token(token).user_id if token else None
                 uid = _ensure_uuid(uid)
 
-                with session_scope() as db:
-                    def create_session_with_uid(db, uid_val):
-                        s = EmotionSession(
-                            user_id=uid_val,
-                            started_at=datetime.utcnow(),
-                            emotion_label=None,
-                            topic=None,
-                            trigger_summary=None,
-                            insight_summary=None,
-                        )
-                        db.add(s)
-                        db.commit()
-                        db.refresh(s)
-                        return s
+                try:
+                    session = await _with_db(_create_emotion_session, uid)
+                except IntegrityError as ie:
+                    logger.warning("open commit FK failed; retrying anonymous | %s", _safe_str(ie))
+                    session = await _with_db(_create_emotion_session, None)
 
-                    try:
-                        session = create_session_with_uid(db, uid)
-                    except IntegrityError as ie:
-                        logger.warning("open commit FK failed; retrying anonymous | %s", _safe_str(ie))
-                        db.rollback()
-                        session = create_session_with_uid(db, None)
-
-                    session_id = session.session_id
+                session_id = session.session_id
 
                 system_prompt = get_system_prompt()
                 sys_fp = leak_guard.fingerprint(system_prompt)
@@ -450,52 +556,15 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                 # MARK A: DB 조회 직전
                 logger.warning("WS MARK A | before DB fetch")
 
-                # DB: 최근 스텝들 + 정책 판단
                 try:
-                    with session_scope() as db:
-                        steps: List[EmotionStep] = list(
-                            db.exec(
-                                select(EmotionStep)
-                                .where(EmotionStep.session_id == session_id)
-                                .order_by(EmotionStep.created_at.asc())
-                            )
-                        )
-
-                        # 회차 제한
-                        if _turn_count(db, session_id) >= CFG.SESSION_MAX_TURNS:
-                            await guard_send({"type": "limit", "message": "max turns reached"})
-                            continue
-
-                        want_activity = is_activity_turn(
-                            user_text=user_text,
-                            db=db,
-                            session_id=session_id,
-                            steps=steps,
-                        )
-                        want_close = is_closing_turn(db, session_id)
-
-                        # user/assistant step_order 계산 (선 커밋 패턴)
-                        last_order = steps[-1].step_order if steps else 0
-                        user_order = last_order + 1
-                        assistant_order = user_order + 1
-
-                        # ① 유저 입력 먼저 저장/커밋
-                        #    ※ 현재 DB는 gpt_response NOT NULL 이므로 빈 문자열로 저장
-                        step_user = EmotionStep(
-                            session_id=session_id,
-                            step_order=user_order,
-                            step_type="user",
-                            user_input=user_text,
-                            gpt_response="",  # <<< 핵심: None 대신 ""
-                            created_at=datetime.utcnow(),
-                            insight_tag=None,
-                        )
-                        db.add(step_user)
-                        db.commit()
-
-                        # 이후 LLM 컨텍스트로 사용할 대화 시퀀스 구성
-                        convo = _steps_to_conversation(steps) + [("user", user_text)]
-
+                    prep = await _with_db(_prepare_message_context, session_id, user_text)
+                    want_activity = bool(prep.get("want_activity"))
+                    want_close = bool(prep.get("want_close"))
+                    assistant_order = int(prep.get("assistant_order") or 0)
+                    convo = prep.get("conversation") or []
+                except TurnLimitReached:
+                    await guard_send({"type": "limit", "message": "max turns reached"})
+                    continue
                 except Exception as e:
                     logger.exception("WS DB fetch or user-step commit failed")
                     await guard_send({"type": "error", "message": f"db_failed: {_safe_str(e)}"})
@@ -563,18 +632,7 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
 
                 # ② 어시스턴트 스텝 저장/커밋
                 try:
-                    with session_scope() as db:
-                        step_assistant = EmotionStep(
-                            session_id=session_id,
-                            step_order=assistant_order,
-                            step_type="assistant",
-                            user_input="",
-                            gpt_response=assistant_text,
-                            created_at=datetime.utcnow(),
-                            insight_tag=None,
-                        )
-                        db.add(step_assistant)
-                        db.commit()
+                    await _with_db(_commit_assistant_step, session_id, assistant_order, assistant_text)
                 except Exception:
                     logger.exception("WS assistant-step commit failed")
                     await guard_send({"type": "error", "message": "server_error:assistant_step_commit"})
@@ -588,21 +646,27 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                 )
 
                 if want_activity:
-                    with session_scope() as db:
-                        mark_activity_injected(db, session_id)
+                    try:
+                        await _with_db(mark_activity_injected, session_id)
+                    except Exception as e:
+                        logger.warning("mark_activity_injected failed | %s", _safe_str(e))
 
                 if want_close:
                     await guard_send({"type": "suggest_close"})
                 
                 if want_activity:
-                    with session_scope() as db:
-                        items = recommend_tasks_for_session(db, session_id)
-                    await guard_send(
-                        TaskRecommendResponse(
-                            type="task_recommend_ok",
-                            items=items,
-                        ).model_dump()
-                    )
+                    try:
+                        items = await _recommend_tasks_async(session_id, 5)
+                    except Exception as e:
+                        logger.warning("task recommend failed | %s", _safe_str(e))
+                    else:
+                        if items:
+                            await guard_send(
+                                TaskRecommendResponse(
+                                    type="task_recommend_ok",
+                                    items=items,
+                                ).model_dump()
+                            )
 
             # ── 세션 종료
             elif typ == MSG_CLOSE:
@@ -616,20 +680,12 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                     await guard_send({"type": "error", "message": f"bad close payload: {e}"})
                     continue
 
-                with session_scope() as db:
-                    s = db.get(EmotionSession, session_id)
-                    if s:
-                        s.ended_at = datetime.utcnow()
-                        if payload.emotion_label:
-                            s.emotion_label = payload.emotion_label
-                        if payload.topic:
-                            s.topic = payload.topic
-                        if payload.trigger_summary:
-                            s.trigger_summary = payload.trigger_summary
-                        if payload.insight_summary:
-                            s.insight_summary = payload.insight_summary
-                        db.add(s)
-                        db.commit()
+                try:
+                    await _with_db(_close_session_record, session_id, payload)
+                except Exception as e:
+                    logger.warning("WS close update failed | %s", _safe_str(e))
+                    await guard_send({"type": "error", "message": "close_failed"})
+                    continue
 
                 await guard_send(EmotionCloseResponse(type="close_ok").model_dump())
                 break
@@ -646,24 +702,10 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                     await guard_send({"type": "error", "message": f"bad task payload: {e}"})
                     continue
 
-                with session_scope() as db:
-                    steps = list(
-                        db.exec(
-                            select(EmotionStep)
-                            .where(EmotionStep.session_id == session_id)
-                            .order_by(EmotionStep.created_at.asc())
-                        )
-                    )
-                    session = db.get(EmotionSession, session_id)
-
                 try:
-                    recs = await recommend_tasks_from_session_core(
-                        steps=steps,
-                        session=session,
-                        max_items=payload.max_items or 5,
-                    )
+                    recs = await _recommend_tasks_async(session_id, payload.max_items or 5)
                 except Exception as e:
-                    await guard_send({"type": "error", "message": f"recommend failed: {e}"})
+                    await guard_send({"type": "error", "message": f"recommend failed: {_safe_str(e)}"})
                     continue
 
                 await guard_send(TaskRecommendResponse(

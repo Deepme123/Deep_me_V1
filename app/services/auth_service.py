@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 from uuid import UUID
 
 from fastapi import HTTPException, Request, Response, status
@@ -21,18 +20,9 @@ from app.models.refresh_token import RefreshToken
 from app.models.user import User
 
 
-async def _extract_refresh_token(request: Request) -> Optional[str]:
-    """Read refresh token from HttpOnly cookie first, then JSON body fallback."""
-    rt = request.cookies.get(REFRESH_COOKIE_NAME)
-    if rt:
-        return rt
-    try:
-        body = await request.json()
-        if isinstance(body, dict):
-            return body.get("refresh_token")
-    except Exception:
-        return None
-    return None
+async def _extract_refresh_token(request: Request) -> str | None:
+    """Read refresh token from HttpOnly cookie only (no JSON/body fallback)."""
+    return request.cookies.get(REFRESH_COOKIE_NAME) or None
 
 
 async def refresh_tokens(
@@ -126,7 +116,6 @@ async def refresh_tokens(
 
     return {
         "access_token": new_access,
-        "refresh_token": new_rt,
         "token_type": "bearer",
         "expires_in": access_cookie_max_age,
         "user_id": str(user.user_id),

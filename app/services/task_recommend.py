@@ -2,7 +2,7 @@
 from typing import List
 from uuid import UUID
 from sqlmodel import select
-from app.db.session import get_session
+from app.db.session import get_session, session_scope
 from app.models.task import Task
 from app.models.emotion import EmotionSession, EmotionStep
 from app.core.prompt_loader import get_task_prompt
@@ -34,7 +34,7 @@ def recommend_tasks_from_session_core(
     - OpenAI 클라이언트는 OPENAI_API_KEY 를 자동 인식.
     선택적으로 OPENAI_BASE_URL / OPENAI_ORG_ID / OPENAI_PROJECT 지원.
     """
-    with next(get_session()) as db:
+    with session_scope() as db:
         # 세션 검증
         sess = db.get(EmotionSession, session_id)
         if not sess or sess.user_id != user_id:

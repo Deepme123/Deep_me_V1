@@ -40,6 +40,7 @@ from app.services.convo_policy import (
     is_closing_turn,
     mark_activity_injected,
     _turn_count,
+    ACTIVITY_STEP_TYPE,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,15 @@ class WSConfig:
     WS_IDLE_TIMEOUT: float = float(os.getenv("WS_IDLE_TIMEOUT", "120"))
     WS_SEND_BUFFER: int = int(os.getenv("WS_SEND_BUFFER", "20"))
     WS_HEARTBEAT_SEC: float = float(os.getenv("WS_HEARTBEAT_SEC", "15"))
+    LLM_STREAM_TIMEOUT: float = float(os.getenv("LLM_STREAM_TIMEOUT", "75"))
+    RECOMMEND_TIMEOUT: float = float(os.getenv("RECOMMEND_TIMEOUT", "15"))
     WS_HISTORY_TURNS: int = max(5, min(10, int(os.getenv("WS_HISTORY_TURNS", "8"))))
+    WS_ALLOWED_ORIGINS: list[str] = [
+        o.strip().rstrip("/")
+        for o in (os.getenv("WS_ALLOWED_ORIGINS") or "http://localhost:3000,http://localhost:8000,http://127.0.0.1").split(",")
+        if o.strip()
+    ]
+    WS_MAX_USER_TEXT_LEN: int = int(os.getenv("WS_MAX_USER_TEXT_LEN", str(8 * 1024)))  # bytes/ASCII-ish
 
 CFG = WSConfig()
 
@@ -85,6 +94,38 @@ class TurnLimitReached(Exception):
     """Raised when a session has reached the configured turn limit."""
     pass
 
+class IdleTimeout(Exception):
+    """Raised when websocket idle timeout hit."""
+    pass
+
+def _normalize_origin(origin: str | None) -> str | None:
+    if not origin:
+        return None
+    return origin.strip().rstrip("/").lower()
+
+def _is_origin_allowed(origin: str | None) -> bool:
+    norm = _normalize_origin(origin)
+    if not norm:
+        return False
+    return norm in {_normalize_origin(o) for o in CFG.WS_ALLOWED_ORIGINS}
+
+def _extract_bearer_token(websocket: WebSocket) -> str | None:
+    auth_header = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
+    if not auth_header:
+        return None
+    if auth_header.lower().startswith("bearer "):
+        return auth_header.split(" ", 1)[1].strip() or None
+    return None
+
+def _extract_token_fallback(websocket: WebSocket) -> str | None:
+    # query param fallback
+    q = websocket.query_params
+    if q:
+        for key in ("access_token", "token", "auth_token"):
+            if q.get(key):
+                return q.get(key)
+    return None
+
 def _run_with_session(fn: Callable[[Session], T], *args, **kwargs) -> T:
     with session_scope() as db:
         return fn(db, *args, **kwargs)
@@ -106,7 +147,13 @@ async def _ws_send_safe(websocket: WebSocket, data: dict, *, timeout: float | No
     except Exception as e:
         logger.warning("WS send failed | %s | keys=%s", _safe_str(e), list(data.keys()))
 
-async def _ws_recv_safe(websocket: WebSocket, *, timeout: float | None = None) -> dict | None:
+async def _ws_recv_safe(
+    websocket: WebSocket,
+    *,
+    timeout: float | None = None,
+    raise_on_timeout: bool = False,
+    strict_json: bool = True,
+) -> dict | None:
     """
     클라이언트 프레임 관용 처리:
     - JSON: dict
@@ -118,6 +165,8 @@ async def _ws_recv_safe(websocket: WebSocket, *, timeout: float | None = None) -
     try:
         event = await asyncio.wait_for(websocket.receive(), timeout=timeout) if timeout else await websocket.receive()
     except asyncio.TimeoutError:
+        if raise_on_timeout:
+            raise IdleTimeout()
         return {"type": "ping"}
     except WebSocketDisconnect:
         raise
@@ -155,11 +204,13 @@ async def _ws_recv_safe(websocket: WebSocket, *, timeout: float | None = None) -
                     if "user_input" in obj or "text" in obj:
                         text_val = obj.get("user_input") or obj.get("text") or ""
                         norm = {"type": "message", "text": text_val}
-                        for k in ("step_type", "emotion_label", "topic", "trigger_summary", "insight_summary", "max_items"):
+                        for k in ("step_type", "emotion_label", "topic", "trigger_summary", "insight_summary", "max_items", "access_token"):
                             if k in obj:
                                 norm[k] = obj[k]
                         return norm
             except Exception:
+                if strict_json:
+                    raise
                 pass
 
         # 2) 단어 명령
@@ -185,8 +236,7 @@ async def _ws_recv_safe(websocket: WebSocket, *, timeout: float | None = None) -
         return {"type": "message", "text": t}
 
     if data is not None:
-        logger.warning("WS binary frame ignored | len=%s", len(data))
-        return None
+        raise ValueError("binary_frames_not_allowed")
 
     return None
 
@@ -278,8 +328,31 @@ def _prepare_message_context(db: Session, session_id: UUID, user_text: str) -> d
     want_close = is_closing_turn(db, session_id)
 
     last_order = steps[-1].step_order if steps else 0
+    # user/assistant orders reserved but not committed until after successful LLM turn
     user_order = last_order + 1
     assistant_order = user_order + 1
+    convo = _steps_to_conversation(steps_for_convo) + [("user", user_text)]
+    return {
+        "want_activity": want_activity,
+        "want_close": want_close,
+        "user_order": user_order,
+        "assistant_order": assistant_order,
+        "conversation": convo,
+    }
+
+def _commit_full_turn(
+    db: Session,
+    session_id: UUID,
+    user_text: str,
+    assistant_text: str,
+    user_order: int,
+    assistant_order: int,
+    *,
+    add_activity_marker: bool,
+) -> None:
+    # Re-check limit just before commit to avoid races between turns.
+    if _turn_count(db, session_id) >= CFG.SESSION_MAX_TURNS:
+        raise TurnLimitReached()
 
     step_user = EmotionStep(
         session_id=session_id,
@@ -290,18 +363,6 @@ def _prepare_message_context(db: Session, session_id: UUID, user_text: str) -> d
         created_at=datetime.utcnow(),
         insight_tag=None,
     )
-    db.add(step_user)
-    db.commit()
-
-    convo = _steps_to_conversation(steps_for_convo) + [("user", user_text)]
-    return {
-        "want_activity": want_activity,
-        "want_close": want_close,
-        "assistant_order": assistant_order,
-        "conversation": convo,
-    }
-
-def _commit_assistant_step(db: Session, session_id: UUID, assistant_order: int, assistant_text: str) -> None:
     step_assistant = EmotionStep(
         session_id=session_id,
         step_order=assistant_order,
@@ -311,7 +372,21 @@ def _commit_assistant_step(db: Session, session_id: UUID, assistant_order: int, 
         created_at=datetime.utcnow(),
         insight_tag=None,
     )
+    db.add(step_user)
     db.add(step_assistant)
+
+    if add_activity_marker:
+        marker = EmotionStep(
+            session_id=session_id,
+            step_order=assistant_order + 1,
+            step_type=ACTIVITY_STEP_TYPE,
+            user_input="",
+            gpt_response="",
+            created_at=datetime.utcnow(),
+            insight_tag=None,
+        )
+        db.add(marker)
+
     db.commit()
 
 def _close_session_record(db: Session, session_id: UUID, payload: EmotionCloseRequest) -> None:
@@ -398,23 +473,47 @@ class LeakGuard:
 # 라우터
 
 @router.websocket("/ws/emotion")
-async def ws_emotion(websocket: WebSocket, user_id: UUID):
-    # 서브프로토콜 수락(있으면)
+async def ws_emotion(websocket: WebSocket):
+    # Pre-accept origin + JWT validation (header/query)
+    origin = websocket.headers.get("origin") or websocket.headers.get("Origin")
+    if not _is_origin_allowed(origin):
+        logger.warning("WS origin rejected | origin=%s", _safe_str(origin))
+        await websocket.close(code=1008, reason="origin_not_allowed")
+        return
+
+    raw_token = _extract_bearer_token(websocket) or _extract_token_fallback(websocket)
+    auth_user_id: UUID | None = None
+    if raw_token:
+        try:
+            auth_payload = decode_access_token(raw_token)
+            auth_user_id = _ensure_uuid(auth_payload.user_id)
+        except Exception:
+            await websocket.close(code=4401, reason="invalid_token")
+            return
+
     subproto = websocket.headers.get("sec-websocket-protocol")
     await websocket.accept(subprotocol=subproto if subproto else None)
 
-    token: str | None = None
     session_id: UUID | None = None
     leak_guard = LeakGuard()
     sys_fp: set[int] = set()
     send_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=CFG.WS_SEND_BUFFER)
     loop = asyncio.get_running_loop()
     last_active = loop.time()
+    shutdown = asyncio.Event()
+    recommend_fuse_tripped = False
+
+    async def close_ws(code: int = 1000, reason: str = "") -> None:
+        if shutdown.is_set():
+            return
+        shutdown.set()
+        with suppress(Exception):
+            await websocket.close(code=code, reason=reason)
 
     async def sender():
         nonlocal last_active
         try:
-            while True:
+            while not shutdown.is_set():
                 try:
                     item = await asyncio.wait_for(send_queue.get(), timeout=CFG.WS_HEARTBEAT_SEC)
                 except asyncio.TimeoutError:
@@ -426,27 +525,29 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
             pass
         except Exception as e:
             logger.warning("WS sender loop error | %s", _safe_str(e))
+        finally:
+            shutdown.set()
 
     async def guard_send(data: dict):
-        await send_queue.put(data)
+        if shutdown.is_set():
+            return
+        try:
+            await asyncio.wait_for(send_queue.put(data), timeout=CFG.WS_HEARTBEAT_SEC)
+        except asyncio.TimeoutError:
+            shutdown.set()
+            raise RuntimeError("send_queue_backpressure")
 
     send_task = asyncio.create_task(sender())
 
-    # ── 연결 직후 쿼리스트링으로 세션 자동 오픈
+    # ── 연결 직후 인증된 사용자 기준으로 세션 자동 오픈
     async def _bootstrap_open_if_possible():
-        nonlocal token, session_id, sys_fp
-        qp = websocket.query_params or {}
-        q_user_id = qp.get("user_id")
-        q_token = qp.get("access_token") or qp.get("token")
-        if not q_user_id and not q_token:
-            return
+        nonlocal session_id, sys_fp, auth_user_id
         try:
-            uid = _ensure_uuid(q_user_id) if q_user_id else None
-            if q_token and not uid:
-                with suppress(Exception):
-                    uid = _ensure_uuid(decode_access_token(q_token).user_id)
+            uid = auth_user_id
+            if not uid:
+                return False
 
-            # user 존재 검증 (없으면 None 처리)
+            # user 존재 검증 (없으면 중단)
             try:
                 from app.models.user import User  # 지연 import로 순환참조 방지
             except Exception:
@@ -455,8 +556,9 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
             if uid and User:
                 user_exists = await _with_db(lambda db: db.get(User, uid) is not None)
                 if not user_exists:
-                    logger.warning("bootstrap: user not found, downgrade to anonymous | user_id=%s", uid)
-                    uid = None
+                    logger.warning("bootstrap: user not found | user_id=%s", uid)
+                    await websocket.close(code=4401, reason="user_not_found")
+                    return
 
             try:
                 session = await _with_db(_create_emotion_session, uid)
@@ -468,21 +570,40 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
 
             system_prompt = get_system_prompt()
             sys_fp = leak_guard.fingerprint(system_prompt)
-            await _ws_send_safe(
-                websocket,
+            await guard_send(
                 EmotionOpenResponse(type="open_ok", session_id=session_id, turns=0).model_dump(),
             )
             logger.info("WS bootstrap open_ok sent | session_id=%s", session_id)
         except Exception:
             logger.exception("WS bootstrap open failed")
+            await close_ws(code=1011, reason="bootstrap_failed")
+            return False
+        return True
 
-    await _bootstrap_open_if_possible()
+    # if we already have a token, bootstrap immediately; otherwise wait for open payload
+    if raw_token:
+        ok = await _bootstrap_open_if_possible()
+        if not ok:
+            with suppress(Exception):
+                send_task.cancel()
+                await asyncio.gather(send_task, return_exceptions=True)
+            return
 
     try:
-        while True:
+        while not shutdown.is_set():
             # 수신을 먼저 기다림
-            msg = await _ws_recv_safe(websocket, timeout=CFG.WS_IDLE_TIMEOUT)
-            if msg is None:
+            try:
+                msg = await _ws_recv_safe(websocket, timeout=CFG.WS_IDLE_TIMEOUT, raise_on_timeout=True, strict_json=True)
+            except IdleTimeout:
+                await guard_send({"type": "error", "message": "idle_timeout"})
+                break
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.warning("WS recv failed | %s", _safe_str(e))
+                await guard_send({"type": "error", "message": "recv_failed"})
+                break
+            if msg is None or shutdown.is_set():
                 continue
 
             # 파싱된 메시지 타입 로깅
@@ -502,6 +623,22 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
 
             # ── 세션 열기
             if typ == MSG_OPEN:
+                # allow token via payload if missing during handshake
+                if not auth_user_id:
+                    tok = msg.get("access_token")
+                    if tok:
+                        try:
+                            auth_payload = decode_access_token(tok)
+                            auth_user_id = _ensure_uuid(auth_payload.user_id)
+                        except Exception:
+                            await guard_send({"type": "error", "message": "invalid_token"})
+                            await close_ws(code=4401, reason="invalid_token")
+                            break
+                    if not auth_user_id:
+                        await guard_send({"type": "error", "message": "auth_required"})
+                        await close_ws(code=4401, reason="auth_required")
+                        break
+
                 if session_id:
                     await guard_send(EmotionOpenResponse(
                         type="open_ok",
@@ -515,11 +652,7 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                     await guard_send({"type": "error", "message": f"bad open payload: {e}"})
                     continue
 
-                token = payload.access_token
-                uid = None
-                with suppress(Exception):
-                    uid = decode_access_token(token).user_id if token else None
-                uid = _ensure_uuid(uid)
+                uid = auth_user_id
 
                 try:
                     session = await _with_db(_create_emotion_session, uid)
@@ -551,6 +684,9 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                     continue
 
                 user_text = payload.text or ""
+                if len(user_text.encode("utf-8")) > CFG.WS_MAX_USER_TEXT_LEN:
+                    await guard_send({"type": "error", "message": "message_too_large"})
+                    continue
                 logger.info("WS recv user | %s", _mask_preview(user_text, 100))
 
                 # MARK A: DB 조회 직전
@@ -560,13 +696,14 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                     prep = await _with_db(_prepare_message_context, session_id, user_text)
                     want_activity = bool(prep.get("want_activity"))
                     want_close = bool(prep.get("want_close"))
+                    user_order = int(prep.get("user_order") or 0)
                     assistant_order = int(prep.get("assistant_order") or 0)
                     convo = prep.get("conversation") or []
                 except TurnLimitReached:
                     await guard_send({"type": "limit", "message": "max turns reached"})
                     continue
                 except Exception as e:
-                    logger.exception("WS DB fetch or user-step commit failed")
+                    logger.exception("WS DB fetch failed")
                     await guard_send({"type": "error", "message": f"db_failed: {_safe_str(e)}"})
                     continue
 
@@ -587,52 +724,58 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                 # 스트리밍 호출 + 누적 버퍼
                 assistant_chunks: List[str] = []
 
-                async def _gen():
-                    try:
-                        async for piece in _iter_chunks(
-                            stream_noa_response(
-                                system_prompt=system_prompt,
-                                task_prompt=task_prompt,
-                                conversation=convo,
-                                temperature=0.7,
-                                max_tokens=800,
-                            )
-                        ):
-                            safe_piece = leak_guard.sanitize_out(piece, sys_fp)
-                            if not safe_piece:
-                                continue
-                            assistant_chunks.append(safe_piece)
-                            logger.debug("WS delta | %s", _mask_preview(safe_piece))
-                            yield safe_piece
-                    except Exception as e:
-                        logger.warning("stream err | %s", _safe_str(e))
-                        raise
+                async def _consume_stream():
+                    async for piece in _iter_chunks(
+                        stream_noa_response(
+                            system_prompt=system_prompt,
+                            task_prompt=task_prompt,
+                            conversation=convo,
+                            temperature=0.7,
+                            max_tokens=800,
+                        )
+                    ):
+                        safe_piece = leak_guard.sanitize_out(piece, sys_fp)
+                        if not safe_piece:
+                            continue
+                        assistant_chunks.append(safe_piece)
+                        logger.debug("WS delta | %s", _mask_preview(safe_piece))
+                        await guard_send(EmotionMessageResponse(type="message_delta", delta=safe_piece).model_dump())
 
-                # 전송
+                stream_failed_reason: str | None = None
                 await guard_send(EmotionMessageResponse(type="message_start").model_dump())
-                stream_failed = False
                 try:
-                    async for piece in _gen():
-                        await guard_send(EmotionMessageResponse(type="message_delta", delta=piece).model_dump())
-                except Exception:
-                    stream_failed = True
-                    await guard_send({"type": "error", "message": "stream failed"})
+                    await asyncio.wait_for(_consume_stream(), timeout=CFG.LLM_STREAM_TIMEOUT)
+                except asyncio.TimeoutError:
+                    stream_failed_reason = "stream_timeout"
+                except Exception as e:
+                    stream_failed_reason = f"stream_failed:{_safe_str(e)}"
                 finally:
                     await guard_send(EmotionMessageResponse(type="message_end").model_dump())
 
-                if stream_failed:
-                    # LLM 실패 시 assistant step을 생성하지 않음
+                if stream_failed_reason:
+                    await guard_send({"type": "error", "message": stream_failed_reason, "turn_dropped": True})
                     continue
 
                 assistant_text = "".join(assistant_chunks).strip()
                 if not assistant_text:
                     # 내용이 비면 저장하지 않고 종료
-                    await guard_send({"type": "error", "message": "empty_assistant_response"})
+                    await guard_send({"type": "error", "message": "empty_assistant_response", "turn_dropped": True})
                     continue
 
-                # ② 어시스턴트 스텝 저장/커밋
+                # ② 사용자/어시스턴트 스텝을 한 트랜잭션으로 커밋
                 try:
-                    await _with_db(_commit_assistant_step, session_id, assistant_order, assistant_text)
+                    await _with_db(
+                        _commit_full_turn,
+                        session_id,
+                        user_text,
+                        assistant_text,
+                        user_order,
+                        assistant_order,
+                        add_activity_marker=want_activity,
+                    )
+                except TurnLimitReached:
+                    await guard_send({"type": "limit", "message": "max turns reached"})
+                    continue
                 except Exception:
                     logger.exception("WS assistant-step commit failed")
                     await guard_send({"type": "error", "message": "server_error:assistant_step_commit"})
@@ -644,12 +787,6 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                         message=assistant_text,
                     ).model_dump()
                 )
-
-                if want_activity:
-                    try:
-                        await _with_db(mark_activity_injected, session_id)
-                    except Exception as e:
-                        logger.warning("mark_activity_injected failed | %s", _safe_str(e))
 
                 if want_close:
                     await guard_send({"type": "suggest_close"})
@@ -702,9 +839,18 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                     await guard_send({"type": "error", "message": f"bad task payload: {e}"})
                     continue
 
+                if recommend_fuse_tripped:
+                    await guard_send({"type": "error", "message": "recommend_unavailable"})
+                    continue
+
                 try:
-                    recs = await _recommend_tasks_async(session_id, payload.max_items or 5)
+                    recs = await asyncio.wait_for(
+                        _recommend_tasks_async(session_id, payload.max_items or 5),
+                        timeout=CFG.RECOMMEND_TIMEOUT,
+                    )
                 except Exception as e:
+                    recommend_fuse_tripped = True
+                    logger.error("task recommend failed | %s", _safe_str(e))
                     await guard_send({"type": "error", "message": f"recommend failed: {_safe_str(e)}"})
                     continue
 
@@ -717,12 +863,13 @@ async def ws_emotion(websocket: WebSocket, user_id: UUID):
                 await guard_send({"type": "error", "message": f"unknown type: {typ}"})
 
     except WebSocketDisconnect:
-        pass
+        shutdown.set()
     except Exception:
         logger.exception("WS fatal error")
         with suppress(Exception):
             await _ws_send_safe(websocket, {"type": "error", "message": "fatal"})
     finally:
+        shutdown.set()
         with suppress(Exception):
             send_task.cancel()
             await asyncio.gather(send_task, return_exceptions=True)

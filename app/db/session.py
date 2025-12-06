@@ -89,5 +89,8 @@ def session_scope():
     s = Session(engine)
     try:
         yield s
+    except Exception:
+        s.rollback()
+        raise
     finally:
         s.close()

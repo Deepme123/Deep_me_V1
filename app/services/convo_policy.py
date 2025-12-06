@@ -84,8 +84,8 @@ def mark_activity_injected(db: Session, session_id: UUID) -> None:
         session_id=session_id,
         step_order=next_order,
         step_type=ACTIVITY_STEP_TYPE,   # "activity_suggest"
-        user_input=None,
-        gpt_response=None,
+        user_input="",
+        gpt_response="",
         created_at=datetime.utcnow(),
         insight_tag=None,
     )

@@ -32,7 +32,6 @@ async def refresh_tokens(
     db: Session,
     set_access_cookie: bool = False,
     access_cookie_secure: bool = False,
-    access_cookie_samesite: str = "lax",
     access_cookie_max_age: int = 0,
 ) -> dict:
     """
@@ -109,7 +108,6 @@ async def refresh_tokens(
             value=new_access,
             httponly=True,
             secure=access_cookie_secure,
-            samesite=access_cookie_samesite,
             max_age=access_cookie_max_age,
             path="/",
         )

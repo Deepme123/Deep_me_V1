@@ -59,11 +59,6 @@ class WSConfig:
     LLM_STREAM_TIMEOUT: float = float(os.getenv("LLM_STREAM_TIMEOUT", "75"))
     RECOMMEND_TIMEOUT: float = float(os.getenv("RECOMMEND_TIMEOUT", "15"))
     WS_HISTORY_TURNS: int = max(5, min(10, int(os.getenv("WS_HISTORY_TURNS", "8"))))
-    WS_ALLOWED_ORIGINS: list[str] = [
-        o.strip().rstrip("/")
-        for o in (os.getenv("WS_ALLOWED_ORIGINS") or "http://localhost:3000,http://localhost:8000,http://127.0.0.1").split(",")
-        if o.strip()
-    ]
     WS_MAX_USER_TEXT_LEN: int = int(os.getenv("WS_MAX_USER_TEXT_LEN", str(8 * 1024)))  # bytes/ASCII-ish
 
 CFG = WSConfig()
@@ -105,17 +100,6 @@ class InvalidPayload(Exception):
 class SendBackpressure(Exception):
     """Raised when websocket send queue is saturated."""
     pass
-
-def _normalize_origin(origin: str | None) -> str | None:
-    if not origin:
-        return None
-    return origin.strip().rstrip("/").lower()
-
-def _is_origin_allowed(origin: str | None) -> bool:
-    norm = _normalize_origin(origin)
-    if not norm:
-        return False
-    return norm in {_normalize_origin(o) for o in CFG.WS_ALLOWED_ORIGINS}
 
 def _extract_bearer_token(websocket: WebSocket) -> str | None:
     auth_header = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
@@ -493,13 +477,7 @@ class LeakGuard:
 
 @router.websocket("/ws/emotion")
 async def ws_emotion(websocket: WebSocket):
-    # Pre-accept origin + JWT validation (header/query)
-    origin = websocket.headers.get("origin") or websocket.headers.get("Origin")
-    if not _is_origin_allowed(origin):
-        logger.warning("WS origin rejected | origin=%s", _safe_str(origin))
-        await websocket.close(code=1008, reason="origin_not_allowed")
-        return
-
+    # Pre-accept JWT validation (header/query)
     raw_token = _extract_bearer_token(websocket) or _extract_token_fallback(websocket)
     auth_user_id = _decode_user_id_from_token(raw_token)
     if not raw_token:

@@ -28,7 +28,6 @@ REFRESH_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "21"))
 
 REFRESH_COOKIE_NAME = os.getenv("REFRESH_COOKIE_NAME", "__Host-deepme_rtok")
 SECURE_COOKIE = _env_bool("SECURE_COOKIE", True)
-SAMESITE_COOKIE = os.getenv("SAMESITE_COOKIE", "lax")  # 'lax' | 'strict' | 'none'
 
 
 # ---- 공통 ----
@@ -105,7 +104,6 @@ def set_refresh_cookie(response, token: str):
         value=token,
         httponly=True,
         secure=SECURE_COOKIE,
-        samesite=SAMESITE_COOKIE,
         path="/",
     )
 

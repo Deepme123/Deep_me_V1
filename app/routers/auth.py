@@ -46,7 +46,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "720"
 # AT를 쿠키로도 내려줄지(웹 혼용 환경에서만 권장; 기본 False)
 AUTH_SET_COOKIE_ON_POST = os.getenv("AUTH_SET_COOKIE_ON_POST", "false").lower() == "true"
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"  # 배포시 true 권장
-COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "lax")  # cross-site면 "none"
 COOKIE_MAX_AGE = 60 * ACCESS_TOKEN_EXPIRE_MINUTES
 
 # 구글 엔드포인트
@@ -93,7 +92,6 @@ def _set_access_cookie_if_enabled(response: Response, jwt_token: str) -> None:
             value=jwt_token,
             httponly=True,
             secure=COOKIE_SECURE,
-            samesite=COOKIE_SAMESITE,
             max_age=COOKIE_MAX_AGE,
             path="/",
         )
@@ -375,7 +373,6 @@ async def refresh_token_endpoint(
         db=db,
         set_access_cookie=AUTH_SET_COOKIE_ON_POST,
         access_cookie_secure=COOKIE_SECURE,
-        access_cookie_samesite=COOKIE_SAMESITE,
         access_cookie_max_age=COOKIE_MAX_AGE,
     )
     return RefreshResponse(**data)

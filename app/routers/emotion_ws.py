@@ -98,6 +98,14 @@ class IdleTimeout(Exception):
     """Raised when websocket idle timeout hit."""
     pass
 
+class InvalidPayload(Exception):
+    """Raised when websocket payload is malformed or unsupported."""
+    pass
+
+class SendBackpressure(Exception):
+    """Raised when websocket send queue is saturated."""
+    pass
+
 def _normalize_origin(origin: str | None) -> str | None:
     if not origin:
         return None
@@ -125,6 +133,17 @@ def _extract_token_fallback(websocket: WebSocket) -> str | None:
             if q.get(key):
                 return q.get(key)
     return None
+
+def _decode_user_id_from_token(token: str | None) -> UUID | None:
+    if not token:
+        return None
+    payload = decode_access_token(token)
+    if not payload or not isinstance(payload, dict):
+        return None
+    try:
+        return _ensure_uuid(payload.get("sub"))
+    except Exception:
+        return None
 
 def _run_with_session(fn: Callable[[Session], T], *args, **kwargs) -> T:
     with session_scope() as db:
@@ -210,7 +229,7 @@ async def _ws_recv_safe(
                         return norm
             except Exception:
                 if strict_json:
-                    raise
+                    raise InvalidPayload("invalid_json")
                 pass
 
         # 2) 단어 명령
@@ -236,7 +255,7 @@ async def _ws_recv_safe(
         return {"type": "message", "text": t}
 
     if data is not None:
-        raise ValueError("binary_frames_not_allowed")
+        raise InvalidPayload("binary_frames_not_allowed")
 
     return None
 
@@ -482,14 +501,13 @@ async def ws_emotion(websocket: WebSocket):
         return
 
     raw_token = _extract_bearer_token(websocket) or _extract_token_fallback(websocket)
-    auth_user_id: UUID | None = None
-    if raw_token:
-        try:
-            auth_payload = decode_access_token(raw_token)
-            auth_user_id = _ensure_uuid(auth_payload.user_id)
-        except Exception:
-            await websocket.close(code=4401, reason="invalid_token")
-            return
+    auth_user_id = _decode_user_id_from_token(raw_token)
+    if not raw_token:
+        await websocket.close(code=4401, reason="auth_required")
+        return
+    if not auth_user_id:
+        await websocket.close(code=4401, reason="invalid_token")
+        return
 
     subproto = websocket.headers.get("sec-websocket-protocol")
     await websocket.accept(subprotocol=subproto if subproto else None)
@@ -535,7 +553,15 @@ async def ws_emotion(websocket: WebSocket):
             await asyncio.wait_for(send_queue.put(data), timeout=CFG.WS_HEARTBEAT_SEC)
         except asyncio.TimeoutError:
             shutdown.set()
-            raise RuntimeError("send_queue_backpressure")
+            with suppress(Exception):
+                await _ws_send_safe(
+                    websocket,
+                    {"type": "error", "message": "send_backpressure"},
+                    timeout=1,
+                )
+            with suppress(Exception):
+                await close_ws(code=1013, reason="send_backpressure")
+            raise SendBackpressure("send_queue_backpressure")
 
     send_task = asyncio.create_task(sender())
 
@@ -580,14 +606,13 @@ async def ws_emotion(websocket: WebSocket):
             return False
         return True
 
-    # if we already have a token, bootstrap immediately; otherwise wait for open payload
-    if raw_token:
-        ok = await _bootstrap_open_if_possible()
-        if not ok:
-            with suppress(Exception):
-                send_task.cancel()
-                await asyncio.gather(send_task, return_exceptions=True)
-            return
+    # Auth token is required; bootstrap immediately.
+    ok = await _bootstrap_open_if_possible()
+    if not ok:
+        with suppress(Exception):
+            send_task.cancel()
+            await asyncio.gather(send_task, return_exceptions=True)
+        return
 
     try:
         while not shutdown.is_set():
@@ -598,6 +623,10 @@ async def ws_emotion(websocket: WebSocket):
                 await guard_send({"type": "error", "message": "idle_timeout"})
                 break
             except WebSocketDisconnect:
+                break
+            except InvalidPayload as e:
+                await guard_send({"type": "error", "message": str(e)})
+                await close_ws(code=1007, reason=str(e))
                 break
             except Exception as e:
                 logger.warning("WS recv failed | %s", _safe_str(e))
@@ -623,21 +652,10 @@ async def ws_emotion(websocket: WebSocket):
 
             # ── 세션 열기
             if typ == MSG_OPEN:
-                # allow token via payload if missing during handshake
                 if not auth_user_id:
-                    tok = msg.get("access_token")
-                    if tok:
-                        try:
-                            auth_payload = decode_access_token(tok)
-                            auth_user_id = _ensure_uuid(auth_payload.user_id)
-                        except Exception:
-                            await guard_send({"type": "error", "message": "invalid_token"})
-                            await close_ws(code=4401, reason="invalid_token")
-                            break
-                    if not auth_user_id:
-                        await guard_send({"type": "error", "message": "auth_required"})
-                        await close_ws(code=4401, reason="auth_required")
-                        break
+                    await guard_send({"type": "error", "message": "auth_required"})
+                    await close_ws(code=4401, reason="auth_required")
+                    break
 
                 if session_id:
                     await guard_send(EmotionOpenResponse(
@@ -792,18 +810,26 @@ async def ws_emotion(websocket: WebSocket):
                     await guard_send({"type": "suggest_close"})
                 
                 if want_activity:
-                    try:
-                        items = await _recommend_tasks_async(session_id, 5)
-                    except Exception as e:
-                        logger.warning("task recommend failed | %s", _safe_str(e))
+                    if recommend_fuse_tripped:
+                        await guard_send({"type": "error", "message": "recommend_unavailable"})
                     else:
-                        if items:
-                            await guard_send(
-                                TaskRecommendResponse(
-                                    type="task_recommend_ok",
-                                    items=items,
-                                ).model_dump()
+                        try:
+                            items = await asyncio.wait_for(
+                                _recommend_tasks_async(session_id, 5),
+                                timeout=CFG.RECOMMEND_TIMEOUT,
                             )
+                        except Exception as e:
+                            recommend_fuse_tripped = True
+                            logger.warning("task recommend failed | %s", _safe_str(e))
+                            await guard_send({"type": "error", "message": "recommend_unavailable"})
+                        else:
+                            if items:
+                                await guard_send(
+                                    TaskRecommendResponse(
+                                        type="task_recommend_ok",
+                                        items=items,
+                                    ).model_dump()
+                                )
 
             # ── 세션 종료
             elif typ == MSG_CLOSE:
@@ -864,6 +890,8 @@ async def ws_emotion(websocket: WebSocket):
 
     except WebSocketDisconnect:
         shutdown.set()
+    except SendBackpressure:
+        logger.warning("WS closed due to send backpressure")
     except Exception:
         logger.exception("WS fatal error")
         with suppress(Exception):

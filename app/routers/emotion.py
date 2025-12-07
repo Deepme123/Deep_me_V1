@@ -19,9 +19,10 @@ from app.dependencies.auth import get_current_user
 from app.services.convo_policy import (
     is_activity_turn,
     is_closing_turn,
-    mark_activity_injected,
     _turn_count,
     SESSION_MAX_TURNS,
+    ACTIVITY_STEP_TYPE,
+    _max_step_order,
 )
 
 
@@ -152,7 +153,6 @@ def generate_emotion_step(
 
     if activity_turn:
         system_prompt = f"{system_prompt}\n\n{get_task_prompt()}"
-        mark_activity_injected(db, input_data.session_id)
 
     if closing_turn:
         system_prompt = f"""{system_prompt}
@@ -172,8 +172,9 @@ def generate_emotion_step(
         recent_steps=recent_all,
     )
 
-    # 스텝 저장(서버에서 step_order 부여) — 사용자/어시스턴트 한 트랜잭션에 기록
-    next_order = (recent_all[-1].step_order + 1) if recent_all else 1
+    # 스텝 저장(서버에서 step_order 부여) — WebSocket과 동일한 순서(user→assistant→activity)
+    current_max_order = _max_step_order(db, input_data.session_id)
+    next_order = current_max_order + 1
     user_step = EmotionStep(
         session_id=input_data.session_id,
         step_order=next_order,
@@ -194,6 +195,18 @@ def generate_emotion_step(
     )
     db.add(user_step)
     db.add(assistant_step)
+
+    if activity_turn:
+        marker = EmotionStep(
+            session_id=input_data.session_id,
+            step_order=next_order + 2,
+            step_type=ACTIVITY_STEP_TYPE,
+            user_input="",
+            gpt_response="",
+            created_at=datetime.utcnow(),
+            insight_tag=None,
+        )
+        db.add(marker)
 
     # 종료 턴이면 세션 종료 타임스탬프 설정
     if closing_turn and not sess.ended_at:

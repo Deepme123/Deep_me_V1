@@ -1,7 +1,7 @@
 # app/routers/emotion_ws.py
 from __future__ import annotations
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from sqlmodel import select, Session
 from uuid import UUID
 from datetime import datetime
@@ -33,6 +33,7 @@ from app.schemas.emotion import (
 )
 from app.services.llm_service import stream_noa_response
 from app.services.task_recommend import recommend_tasks_from_session_core
+from app.services.web_test_user import resolve_emotion_user_id
 from app.core.jwt import decode_access_token
 from app.core.prompt_loader import get_system_prompt, get_task_prompt
 from app.services.convo_policy import (
@@ -480,11 +481,17 @@ async def ws_emotion(websocket: WebSocket):
     # Pre-accept JWT validation (header/query)
     raw_token = _extract_bearer_token(websocket) or _extract_token_fallback(websocket)
     auth_user_id = _decode_user_id_from_token(raw_token)
-    if not raw_token:
+    if raw_token and not auth_user_id:
+        await websocket.close(code=4401, reason="invalid_token")
+        return
+    try:
+        with session_scope() as db:
+            auth_user_id = resolve_emotion_user_id(db, auth_user_id)
+    except HTTPException:
         await websocket.close(code=4401, reason="auth_required")
         return
-    if not auth_user_id:
-        await websocket.close(code=4401, reason="invalid_token")
+    except Exception:
+        await websocket.close(code=1011, reason="auth_resolve_failed")
         return
 
     subproto = websocket.headers.get("sec-websocket-protocol")

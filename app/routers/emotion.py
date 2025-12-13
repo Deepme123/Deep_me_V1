@@ -1,43 +1,52 @@
 # app/routers/emotion.py
+from datetime import datetime
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
-from uuid import UUID
-from datetime import datetime
 
+from app.core.prompt_loader import get_system_prompt, get_task_prompt
 from app.db.session import get_session
+from app.dependencies.auth import get_current_user_optional
 from app.models.emotion import EmotionSession, EmotionStep
 from app.schemas.emotion import (
     EmotionSessionCreate,
     EmotionSessionRead,
     EmotionStepCreate,
-    EmotionStepRead,
     EmotionStepGenerateInput,
+    EmotionStepRead,
 )
-from app.services.llm_service import generate_noa_response
-from app.core.prompt_loader import get_system_prompt, get_task_prompt
-from app.dependencies.auth import get_current_user
 from app.services.convo_policy import (
+    ACTIVITY_STEP_TYPE,
+    SESSION_MAX_TURNS,
+    _max_step_order,
+    _turn_count,
     is_activity_turn,
     is_closing_turn,
-    _turn_count,
-    SESSION_MAX_TURNS,
-    ACTIVITY_STEP_TYPE,
-    _max_step_order,
 )
-
+from app.services.llm_service import generate_noa_response
+from app.services.web_test_user import resolve_emotion_user_id
 
 router = APIRouter(prefix="/emotion", tags=["Emotion"])
+
+
+def _emotion_user_id(
+    db: Session = Depends(get_session),
+    current_user: str | None = Depends(get_current_user_optional),
+) -> UUID:
+    return resolve_emotion_user_id(db, current_user)
+
 
 @router.get("/sessions", response_model=list[EmotionSessionRead])
 def list_sessions(
     db: Session = Depends(get_session),
-    current_user: str = Depends(get_current_user),
+    emotion_user_id: UUID = Depends(_emotion_user_id),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
     stmt = (
         select(EmotionSession)
-        .where(EmotionSession.user_id == UUID(current_user))
+        .where(EmotionSession.user_id == emotion_user_id)
         .order_by(EmotionSession.started_at.desc())
         .limit(limit)
         .offset(offset)
@@ -51,10 +60,10 @@ def list_steps(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_session),
-    current_user: str = Depends(get_current_user),
+    emotion_user_id: UUID = Depends(_emotion_user_id),
 ):
     sess = db.get(EmotionSession, session_id)
-    if not sess or sess.user_id != UUID(current_user):
+    if not sess or sess.user_id != emotion_user_id:
         raise HTTPException(status_code=404, detail="session not found")
 
     stmt = (
@@ -71,14 +80,14 @@ def list_steps(
 def create_emotion_session(
     session_data: EmotionSessionCreate,
     db: Session = Depends(get_session),
-    current_user: str = Depends(get_current_user),
+    emotion_user_id: UUID = Depends(_emotion_user_id),
 ):
-    if session_data.user_id and session_data.user_id != UUID(current_user):
+    if session_data.user_id and session_data.user_id != emotion_user_id:
         raise HTTPException(status_code=403, detail="user_id mismatch")
 
     new_session = EmotionSession(
         **session_data.dict(exclude={"user_id"}),
-        user_id=UUID(current_user),
+        user_id=emotion_user_id,
     )
     db.add(new_session)
     db.commit()
@@ -90,10 +99,10 @@ def create_emotion_session(
 def create_emotion_step(
     step: EmotionStepCreate,
     db: Session = Depends(get_session),
-    current_user: str = Depends(get_current_user),
+    emotion_user_id: UUID = Depends(_emotion_user_id),
 ):
     sess = db.get(EmotionSession, step.session_id)
-    if not sess or sess.user_id != UUID(current_user):
+    if not sess or sess.user_id != emotion_user_id:
         raise HTTPException(status_code=404, detail="session not found")
 
     new_step = EmotionStep(
@@ -115,33 +124,32 @@ def create_emotion_step(
 def generate_emotion_step(
     input_data: EmotionStepGenerateInput,
     db: Session = Depends(get_session),
-    current_user: str = Depends(get_current_user),
+    emotion_user_id: UUID = Depends(_emotion_user_id),
 ):
     if input_data.session_id is None:
         raise HTTPException(status_code=400, detail="session_id is required")
 
-    # 세션 존재 및 소유자 검증
     sess = db.get(EmotionSession, input_data.session_id)
-    if not sess or sess.user_id != UUID(current_user):
+    if not sess or sess.user_id != emotion_user_id:
         raise HTTPException(status_code=404, detail="session not found")
 
-    # 🔒 한도 초과 가드 (LLM 호출 전에 차단)
+    # ?”’ ?œë„ ì´ˆê³¼ ê°€??(LLM ?¸ì¶œ ?„ì— ì°¨ë‹¨)
     current_turns = _turn_count(db, input_data.session_id)
     if current_turns >= SESSION_MAX_TURNS:
         if not sess.ended_at:
             sess.ended_at = datetime.utcnow()
             db.add(sess)
             db.commit()
-        raise HTTPException(status_code=409, detail="대화 세션이 종료되었어. 새 세션을 시작해줘.")
+        raise HTTPException(status_code=409, detail="?€???¸ì…˜??ì¢…ë£Œ?˜ì—ˆ?? ???¸ì…˜???œìž‘?´ì¤˜.")
 
-    # 최근 스텝 조회(역할 보존 전달)
+    # ìµœê·¼ ?¤í… ì¡°íšŒ(??•  ë³´ì¡´ ?„ë‹¬)
     recent_all = db.exec(
         select(EmotionStep)
         .where(EmotionStep.session_id == input_data.session_id)
         .order_by(EmotionStep.step_order)
     ).all()
 
-    # 시스템 프롬프트 조립
+    # ?œìŠ¤???„ë¡¬?„íŠ¸ ì¡°ë¦½
     system_prompt = get_system_prompt()
     activity_turn = is_activity_turn(
         user_text=input_data.user_input,
@@ -157,22 +165,22 @@ def generate_emotion_step(
     if closing_turn:
         system_prompt = f"""{system_prompt}
 
-[대화 마무리 지침](최우선)
-- 아래 지침은 다른 모든 규칙보다 우선한다.
-- 질문 금지. 요청하지 않은 과제 제안 금지. 이 메시지로 대화 종료.
-- 핵심 요약 2줄
-- 오늘 배운 1가지 강조
-- 간단한 끝인사 1줄
+[?€??ë§ˆë¬´ë¦?ì§€ì¹?(ìµœìš°??
+- ?„ëž˜ ì§€ì¹¨ì? ?¤ë¥¸ ëª¨ë“  ê·œì¹™ë³´ë‹¤ ?°ì„ ?œë‹¤.
+- ì§ˆë¬¸ ê¸ˆì?. ?”ì²­?˜ì? ?Šì? ê³¼ì œ ?œì•ˆ ê¸ˆì?. ??ë©”ì‹œì§€ë¡??€??ì¢…ë£Œ.
+- ?µì‹¬ ?”ì•½ 2ì¤?
+- ?¤ëŠ˜ ë°°ìš´ 1ê°€ì§€ ê°•ì¡°
+- ê°„ë‹¨???ì¸??1ì¤?
 """
 
-    # LLM 응답 생성
+    # LLM ?‘ë‹µ ?ì„±
     response = generate_noa_response(
         input_data=input_data,
         system_prompt=system_prompt,
         recent_steps=recent_all,
     )
 
-    # 스텝 저장(서버에서 step_order 부여) — WebSocket과 동일한 순서(user→assistant→activity)
+    # ?¤í… ?€???œë²„?ì„œ step_order ë¶€?? ??WebSocketê³??™ì¼???œì„œ(user?’assistant?’activity)
     current_max_order = _max_step_order(db, input_data.session_id)
     next_order = current_max_order + 1
     user_step = EmotionStep(
@@ -208,7 +216,7 @@ def generate_emotion_step(
         )
         db.add(marker)
 
-    # 종료 턴이면 세션 종료 타임스탬프 설정
+    # ì¢…ë£Œ ?´ì´ë©??¸ì…˜ ì¢…ë£Œ ?€?„ìŠ¤?¬í”„ ?¤ì •
     if closing_turn and not sess.ended_at:
         sess.ended_at = datetime.utcnow()
         db.add(sess)
@@ -216,4 +224,3 @@ def generate_emotion_step(
     db.commit()
     db.refresh(assistant_step)
     return assistant_step
-

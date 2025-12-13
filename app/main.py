@@ -14,7 +14,7 @@ from app.models import task as _m_task  # noqa: F401
 from app.models import refresh_token as _m_refresh  # noqa: F401
 
 # 라우터
-from app.routers import emotion, auth, user, task
+from app.routers import emotion, auth, user, task, prompts
 from app.routers.emotion_ws import ws_router as emotion_ws_router
 from app.routers import health_llm 
 
@@ -48,6 +48,7 @@ app.include_router(emotion_ws_router)
 app.include_router(auth.auth_router)
 app.include_router(user.user_router)
 app.include_router(task.router)
+app.include_router(prompts.router)
 
 
 @app.on_event("startup")

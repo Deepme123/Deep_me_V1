@@ -16,11 +16,11 @@ PROMPT_ADMIN_KEY = os.getenv("PROMPT_ADMIN_KEY", "") or ""
 PROMPT_ADMIN_DEV_ALLOW = os.getenv("PROMPT_ADMIN_DEV_ALLOW", "false").lower() == "true"
 ENV = os.getenv("ENV", "dev")
 
-# Require auth by default; allow explicit dev bypass via env flag for GETs only.
+# Public prompts API: no auth required.
 router = APIRouter(
     prefix="/prompts",
     tags=["prompts"],
-    dependencies=[] if PROMPT_API_DEV_PUBLIC else [Depends(get_current_user)],
+    dependencies=[],
 )
 
 MAX_PROMPT_BYTES = 50 * 1024  # 50KB safety cap
@@ -120,7 +120,6 @@ def read_task_prompt():
 def update_system_prompt(
     payload: PromptUpdate,
     x_admin_key: Optional[str] = Header(None, convert_underscores=False),
-    user_id: str = Depends(get_current_user),
 ):
     _ensure_admin(x_admin_key)
     return _update_prompt("system", prompt_loader.PROMPT_PATH, payload.content)
@@ -130,7 +129,6 @@ def update_system_prompt(
 def update_task_prompt(
     payload: PromptUpdate,
     x_admin_key: Optional[str] = Header(None, convert_underscores=False),
-    user_id: str = Depends(get_current_user),
 ):
     _ensure_admin(x_admin_key)
     return _update_prompt("task", prompt_loader.TASK_PROMPT_PATH, payload.content)

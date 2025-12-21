@@ -1,8 +1,9 @@
 # app/main.py
 import os
 import logging
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from sqlmodel import text
 
 from app.core.logging_config import setup_logging
@@ -40,6 +41,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def prompts_cors_middleware(request: Request, call_next):
+    if not request.url.path.startswith("/prompts"):
+        return await call_next(request)
+    if request.method == "OPTIONS":
+        response = Response(status_code=204)
+    else:
+        response = await call_next(request)
+    origin = request.headers.get("origin")
+    response.headers["Access-Control-Allow-Origin"] = origin or "*"
+    response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "GET,PUT,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = request.headers.get(
+        "access-control-request-headers", "*"
+    )
+    response.headers["Access-Control-Max-Age"] = "600"
+    return response
 
 # 라우터 등록
 app.include_router(health_llm.router)

@@ -5,16 +5,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.core import prompt_loader
 from app.dependencies.auth import get_current_user
 
 PROMPT_API_DEV_PUBLIC = os.getenv("PROMPT_API_DEV_PUBLIC", "false").lower() == "true"
-PROMPT_ADMIN_KEY = os.getenv("PROMPT_ADMIN_KEY", "") or ""
-PROMPT_ADMIN_DEV_ALLOW = os.getenv("PROMPT_ADMIN_DEV_ALLOW", "false").lower() == "true"
-ENV = os.getenv("ENV", "dev")
 
 # Public prompts API: no auth required.
 router = APIRouter(
@@ -45,22 +42,6 @@ def _build_prompt_response(prompt_type: str, content: str, path: Path) -> dict:
         "sha256": sha256,
         "updated_at": updated_at,
     }
-
-
-def _ensure_admin(x_admin_key: Optional[str]) -> None:
-    # When no admin key is configured, block updates unless explicitly allowed in dev.
-    if not PROMPT_ADMIN_KEY:
-        if ENV == "dev" and PROMPT_ADMIN_DEV_ALLOW:
-            return
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="prompt_update_disabled",
-        )
-    if x_admin_key != PROMPT_ADMIN_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="invalid_admin_key",
-        )
 
 
 def _validate_content(content: str) -> str:
@@ -119,16 +100,12 @@ def read_task_prompt():
 @router.put("/system")
 def update_system_prompt(
     payload: PromptUpdate,
-    x_admin_key: Optional[str] = Header(None, convert_underscores=False),
 ):
-    _ensure_admin(x_admin_key)
     return _update_prompt("system", prompt_loader.PROMPT_PATH, payload.content)
 
 
 @router.put("/task")
 def update_task_prompt(
     payload: PromptUpdate,
-    x_admin_key: Optional[str] = Header(None, convert_underscores=False),
 ):
-    _ensure_admin(x_admin_key)
     return _update_prompt("task", prompt_loader.TASK_PROMPT_PATH, payload.content)

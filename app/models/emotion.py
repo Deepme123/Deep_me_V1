@@ -1,10 +1,13 @@
 from sqlmodel import SQLModel, Field, Relationship
+from sqlalchemy import Column, ForeignKey, Index, UniqueConstraint
 from typing import Optional, List
 from uuid import UUID, uuid4
 from datetime import datetime
 
 # 1. 감정 세션 모델
 class EmotionSession(SQLModel, table=True):
+    __tablename__ = "emotionsession"
+
     session_id: UUID = Field(default_factory=uuid4, primary_key=True)
     user_id: UUID = Field(foreign_key="user.user_id")
     started_at: datetime = Field(default_factory=datetime.utcnow)
@@ -20,8 +23,21 @@ class EmotionSession(SQLModel, table=True):
 
 # 2. 감정 단계(스텝) 모델
 class EmotionStep(SQLModel, table=True):
+    __tablename__ = "emotionstep"
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "step_order", name="uq_emotionstep_session_order"),
+        Index("ix_emotionstep_session_order", "session_id", "step_order"),
+    )
+
     step_id: UUID = Field(default_factory=uuid4, primary_key=True)
-    session_id: UUID = Field(foreign_key="emotionsession.session_id")
+    session_id: UUID = Field(
+        sa_column=Column(
+            ForeignKey("emotionsession.session_id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
     step_order: int
     step_type: str
     user_input: str

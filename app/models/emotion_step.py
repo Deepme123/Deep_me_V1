@@ -6,14 +6,25 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from sqlmodel import SQLModel, Field
-from sqlalchemy import Column, Text
+from sqlalchemy import Column, ForeignKey, Index, Text, UniqueConstraint
 
 
 class EmotionStep(SQLModel, table=True):
     __tablename__ = "emotionstep"
 
+    __table_args__ = (
+        UniqueConstraint("session_id", "step_order", name="uq_emotionstep_session_order"),
+        Index("ix_emotionstep_session_order", "session_id", "step_order"),
+    )
+
     step_id: UUID = Field(default_factory=uuid4, primary_key=True, index=True)
-    session_id: UUID = Field(index=True)
+    session_id: UUID = Field(
+        sa_column=Column(
+            ForeignKey("emotionsession.session_id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
     step_order: int
     step_type: str  # "user" | "assistant"
 

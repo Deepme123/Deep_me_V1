@@ -43,7 +43,7 @@ from app.services.convo_policy import (
     _turn_count,
     ACTIVITY_STEP_TYPE,
 )
-from app.services.step_manager import build_step_context, step_for_prompt
+from app.services.step_manager import build_soft_timeout_hint, build_step_context, step_for_prompt
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -339,6 +339,7 @@ def _prepare_message_context(db: Session, session_id: UUID, user_text: str) -> d
     convo = _steps_to_conversation(steps_for_convo) + [("user", user_text)]
     current_step = step_for_prompt(steps, user_text)
     step_context = build_step_context(current_step)
+    soft_timeout_hint = build_soft_timeout_hint(steps, user_text)
     return {
         "want_activity": want_activity,
         "want_close": want_close,
@@ -347,6 +348,7 @@ def _prepare_message_context(db: Session, session_id: UUID, user_text: str) -> d
         "conversation": convo,
         "current_step": current_step,
         "step_context": step_context,
+        "soft_timeout_hint": soft_timeout_hint,
     }
 
 def _commit_full_turn(
@@ -708,6 +710,7 @@ async def ws_emotion(websocket: WebSocket):
                     assistant_order = int(prep.get("assistant_order") or 0)
                     convo = prep.get("conversation") or []
                     step_context = prep.get("step_context") or ""
+                    soft_timeout_hint = prep.get("soft_timeout_hint") or ""
                 except TurnLimitReached:
                     await guard_send({"type": "limit", "message": "max turns reached"})
                     continue
@@ -724,6 +727,8 @@ async def ws_emotion(websocket: WebSocket):
                     system_prompt = get_system_prompt()
                     if step_context:
                         system_prompt = f"{system_prompt}\n\n{step_context}"
+                    if soft_timeout_hint:
+                        system_prompt = f"{system_prompt}\n\n{soft_timeout_hint}"
                     task_prompt = get_task_prompt() if want_activity else None
                 except Exception as e:
                     logger.exception("WS prompt load failed")

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import re
 from typing import Callable, Iterable, List
 
 from app.models.emotion import EmotionStep
+
+SOFT_TIMEOUT_TURNS = int(os.getenv("SOFT_TIMEOUT_TURNS", "3"))
 
 
 @dataclass(frozen=True)
@@ -146,21 +149,32 @@ def advance_step(current_step: int, user_text: str, assistant_text: str) -> int:
 
 
 def compute_current_step(steps: List[EmotionStep]) -> int:
+    step, _stagnant = compute_step_status(steps)
+    return _clamp_step(step)
+
+
+def compute_step_status(steps: List[EmotionStep]) -> tuple[int, int]:
     step = 1
     pending_user = ""
+    stagnant_turns = 0
     for s in steps:
         if s.step_type == "user":
             pending_user = s.user_input or ""
         elif s.step_type == "assistant":
+            before = step
             after_user = advance_step(step, pending_user, "")
             if after_user != step:
                 step = after_user
             else:
                 step = advance_step(step, pending_user, s.gpt_response or "")
+            if step == before:
+                stagnant_turns += 1
+            else:
+                stagnant_turns = 0
             pending_user = ""
         else:
             continue
-    return _clamp_step(step)
+    return _clamp_step(step), stagnant_turns
 
 
 def step_for_prompt(steps: List[EmotionStep], pending_user_text: str) -> int:
@@ -188,4 +202,37 @@ def build_step_context(current_step: int) -> str:
         f"step: {meta.step}/{MAX_STEP}\n"
         f"name: {meta.name}\n"
         f"focus: {meta.focus}"
+    )
+
+
+_SOFT_HINTS = {
+    1: "Keep greeting short, then invite a small next share without pressing.",
+    2: "Name the feeling softly and mirror the intensity; offer 2 gentle labels.",
+    3: "Anchor in a concrete moment; if needed, ask for one specific scene.",
+    4: "Link feeling to body cues; prompt one bodily signal if stuck.",
+    5: "Surface the thought in simple words; reflect with a short paraphrase.",
+    6: "Point to a possible standard/value; offer a light guess, not a claim.",
+    7: "Notice what they did or avoided; connect it to the feeling.",
+    8: "Give a brief recap; avoid new questions unless needed.",
+    9: "Elicit a want/need; suggest two options to choose from.",
+    10: "Offer a reframe as a tentative alternative; ask for confirmation only.",
+    11: "Close gently; reinforce that it's okay to pause and hold.",
+}
+
+
+def build_soft_timeout_hint(steps: List[EmotionStep], pending_user_text: str) -> str:
+    """
+    If the conversation stays in the same step too long, keep the step but
+    provide a strategy hint to adjust the response style.
+    """
+    _step, stagnant_turns = compute_step_status(steps)
+    if stagnant_turns < max(1, SOFT_TIMEOUT_TURNS):
+        return ""
+    current_step = step_for_prompt(steps, pending_user_text)
+    hint = _SOFT_HINTS.get(current_step, "Vary reflection and keep the pace gentle.")
+    return (
+        "[SOFT TIMEOUT]\n"
+        f"stagnant_turns: {stagnant_turns}\n"
+        "rule: keep the current step; change response strategy only.\n"
+        f"hint: {hint}"
     )

@@ -9,7 +9,7 @@ from app.core.prompt_loader import get_system_prompt, get_task_prompt
 from app.db.session import get_session
 from app.dependencies.auth import get_current_user_optional
 from app.models.emotion import EmotionSession, EmotionStep
-from app.services.step_manager import build_step_context, step_for_prompt
+from app.services.step_manager import build_soft_timeout_hint, build_step_context, step_for_prompt
 from app.schemas.emotion import (
     EmotionSessionCreate,
     EmotionSessionRead,
@@ -163,7 +163,10 @@ def generate_emotion_step(
     # ?œìŠ¤???„ë¡¬?„íŠ¸ ì¡°ë¦½
     system_prompt = get_system_prompt()
     step_context = build_step_context(step_for_prompt(recent_all, input_data.user_input))
+    soft_timeout_hint = build_soft_timeout_hint(recent_all, input_data.user_input)
     system_prompt = f"{system_prompt}\n\n{step_context}"
+    if soft_timeout_hint:
+        system_prompt = f"{system_prompt}\n\n{soft_timeout_hint}"
     activity_turn = is_activity_turn(
         user_text=input_data.user_input,
         db=db,

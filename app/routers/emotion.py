@@ -9,7 +9,14 @@ from app.core.prompt_loader import get_system_prompt, get_task_prompt
 from app.db.session import get_session
 from app.dependencies.auth import get_current_user_optional
 from app.models.emotion import EmotionSession, EmotionStep
-from app.services.step_manager import build_soft_timeout_hint, build_step_context, step_for_prompt
+from app.services.step_manager import (
+    build_end_session_context,
+    build_fixed_farewell,
+    build_soft_timeout_hint,
+    build_step_context,
+    extract_end_session_marker,
+    step_for_prompt,
+)
 from app.schemas.emotion import (
     EmotionSessionCreate,
     EmotionSessionRead,
@@ -19,11 +26,8 @@ from app.schemas.emotion import (
 )
 from app.services.convo_policy import (
     ACTIVITY_STEP_TYPE,
-    SESSION_MAX_TURNS,
     _max_step_order,
-    _turn_count,
     is_activity_turn,
-    is_closing_turn,
 )
 from app.services.llm_service import generate_noa_response
 from app.services.web_test_user import resolve_emotion_user_id
@@ -145,15 +149,6 @@ def generate_emotion_step(
         raise HTTPException(status_code=404, detail="session not found")
 
     # ?”’ ?œë„ ì´ˆê³¼ ê°€??(LLM ?¸ì¶œ ?„ì— ì°¨ë‹¨)
-    current_turns = _turn_count(db, input_data.session_id)
-    if current_turns >= SESSION_MAX_TURNS:
-        if not sess.ended_at:
-            sess.ended_at = datetime.utcnow()
-            db.add(sess)
-            db.commit()
-        raise HTTPException(status_code=409, detail="?€???¸ì…˜??ì¢…ë£Œ?˜ì—ˆ?? ???¸ì…˜???œìž‘?´ì¤˜.")
-
-    # ìµœê·¼ ?¤í… ì¡°íšŒ(??•  ë³´ì¡´ ?„ë‹¬)
     recent_all = db.exec(
         select(EmotionStep)
         .where(EmotionStep.session_id == input_data.session_id)
@@ -161,32 +156,23 @@ def generate_emotion_step(
     ).all()
 
     # ?œìŠ¤???„ë¡¬?„íŠ¸ ì¡°ë¦½
+    current_step = step_for_prompt(recent_all, input_data.user_input)
     system_prompt = get_system_prompt()
-    step_context = build_step_context(step_for_prompt(recent_all, input_data.user_input))
+    step_context = build_step_context(current_step)
     soft_timeout_hint = build_soft_timeout_hint(recent_all, input_data.user_input)
     system_prompt = f"{system_prompt}\n\n{step_context}"
     if soft_timeout_hint:
         system_prompt = f"{system_prompt}\n\n{soft_timeout_hint}"
+    end_session_context = build_end_session_context(current_step)
+    if end_session_context:
+        system_prompt = f"{system_prompt}\n\n{end_session_context}"
     activity_turn = is_activity_turn(
         user_text=input_data.user_input,
         db=db,
         session_id=input_data.session_id,
         steps=recent_all,
     )
-    closing_turn = is_closing_turn(db, input_data.session_id)
-
     task_prompt = get_task_prompt() if activity_turn else None
-
-    if closing_turn:
-        system_prompt = f"""{system_prompt}
-
-[?€??ë§ˆë¬´ë¦?ì§€ì¹?(ìµœìš°??
-- ?„ëž˜ ì§€ì¹¨ì? ?¤ë¥¸ ëª¨ë“  ê·œì¹™ë³´ë‹¤ ?°ì„ ?œë‹¤.
-- ì§ˆë¬¸ ê¸ˆì?. ?”ì²­?˜ì? ?Šì? ê³¼ì œ ?œì•ˆ ê¸ˆì?. ??ë©”ì‹œì§€ë¡??€??ì¢…ë£Œ.
-- ?µì‹¬ ?”ì•½ 2ì¤?
-- ?¤ëŠ˜ ë°°ìš´ 1ê°€ì§€ ê°•ì¡°
-- ê°„ë‹¨???ì¸??1ì¤?
-"""
 
     # LLM ?‘ë‹µ ?ì„±
     convo = _steps_to_conversation(recent_all) + [("user", input_data.user_input)]
@@ -197,6 +183,10 @@ def generate_emotion_step(
         temperature=input_data.temperature,
         max_tokens=input_data.max_completion_tokens,
     )
+    response, end_by_token = extract_end_session_marker(response)
+    if current_step >= 11 or end_by_token:
+        response = build_fixed_farewell()
+        end_by_token = True
 
     # ?¤í… ?€???œë²„?ì„œ step_order ë¶€?? ??WebSocketê³??™ì¼???œì„œ(user?’assistant?’activity)
     current_max_order = _max_step_order(db, input_data.session_id)
@@ -235,7 +225,7 @@ def generate_emotion_step(
         db.add(marker)
 
     # ì¢…ë£Œ ?´ì´ë©??¸ì…˜ ì¢…ë£Œ ?€?„ìŠ¤?¬í”„ ?¤ì •
-    if closing_turn and not sess.ended_at:
+    if (current_step >= 11 or end_by_token) and not sess.ended_at:
         sess.ended_at = datetime.utcnow()
         db.add(sess)
 

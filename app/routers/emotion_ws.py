@@ -38,12 +38,17 @@ from app.core.jwt import decode_access_token
 from app.core.prompt_loader import get_system_prompt, get_task_prompt
 from app.services.convo_policy import (
     is_activity_turn,
-    is_closing_turn,
     mark_activity_injected,
-    _turn_count,
     ACTIVITY_STEP_TYPE,
 )
-from app.services.step_manager import build_soft_timeout_hint, build_step_context, step_for_prompt
+from app.services.step_manager import (
+    build_end_session_context,
+    build_fixed_farewell,
+    build_soft_timeout_hint,
+    build_step_context,
+    extract_end_session_marker,
+    step_for_prompt,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -321,16 +326,12 @@ def _prepare_message_context(db: Session, session_id: UUID, user_text: str) -> d
     max_entries = CFG.WS_HISTORY_TURNS * 2  # user+assistant per turn
     steps_for_convo = steps[-max_entries:] if len(steps) > max_entries else steps
 
-    if _turn_count(db, session_id) >= CFG.SESSION_MAX_TURNS:
-        raise TurnLimitReached()
-
     want_activity = is_activity_turn(
         user_text=user_text,
         db=db,
         session_id=session_id,
         steps=steps,
     )
-    want_close = is_closing_turn(db, session_id)
 
     last_order = steps[-1].step_order if steps else 0
     # user/assistant orders reserved but not committed until after successful LLM turn
@@ -339,15 +340,16 @@ def _prepare_message_context(db: Session, session_id: UUID, user_text: str) -> d
     convo = _steps_to_conversation(steps_for_convo) + [("user", user_text)]
     current_step = step_for_prompt(steps, user_text)
     step_context = build_step_context(current_step)
+    end_session_context = build_end_session_context(current_step)
     soft_timeout_hint = build_soft_timeout_hint(steps, user_text)
     return {
         "want_activity": want_activity,
-        "want_close": want_close,
         "user_order": user_order,
         "assistant_order": assistant_order,
         "conversation": convo,
         "current_step": current_step,
         "step_context": step_context,
+        "end_session_context": end_session_context,
         "soft_timeout_hint": soft_timeout_hint,
     }
 
@@ -361,10 +363,6 @@ def _commit_full_turn(
     *,
     add_activity_marker: bool,
 ) -> None:
-    # Re-check limit just before commit to avoid races between turns.
-    if _turn_count(db, session_id) >= CFG.SESSION_MAX_TURNS:
-        raise TurnLimitReached()
-
     step_user = EmotionStep(
         session_id=session_id,
         step_order=user_order,
@@ -412,6 +410,13 @@ def _close_session_record(db: Session, session_id: UUID, payload: EmotionCloseRe
             s.trigger_summary = payload.trigger_summary
         if payload.insight_summary:
             s.insight_summary = payload.insight_summary
+        db.add(s)
+        db.commit()
+
+def _mark_session_ended(db: Session, session_id: UUID) -> None:
+    s = db.get(EmotionSession, session_id)
+    if s and not s.ended_at:
+        s.ended_at = datetime.utcnow()
         db.add(s)
         db.commit()
 
@@ -705,12 +710,13 @@ async def ws_emotion(websocket: WebSocket):
                 try:
                     prep = await _with_db(_prepare_message_context, session_id, user_text)
                     want_activity = bool(prep.get("want_activity"))
-                    want_close = bool(prep.get("want_close"))
                     user_order = int(prep.get("user_order") or 0)
                     assistant_order = int(prep.get("assistant_order") or 0)
                     convo = prep.get("conversation") or []
                     step_context = prep.get("step_context") or ""
+                    end_session_context = prep.get("end_session_context") or ""
                     soft_timeout_hint = prep.get("soft_timeout_hint") or ""
+                    current_step = int(prep.get("current_step") or 0)
                 except TurnLimitReached:
                     await guard_send({"type": "limit", "message": "max turns reached"})
                     continue
@@ -727,6 +733,8 @@ async def ws_emotion(websocket: WebSocket):
                     system_prompt = get_system_prompt()
                     if step_context:
                         system_prompt = f"{system_prompt}\n\n{step_context}"
+                    if end_session_context:
+                        system_prompt = f"{system_prompt}\n\n{end_session_context}"
                     if soft_timeout_hint:
                         system_prompt = f"{system_prompt}\n\n{soft_timeout_hint}"
                     task_prompt = get_task_prompt() if want_activity else None
@@ -777,6 +785,10 @@ async def ws_emotion(websocket: WebSocket):
                     # 내용이 비면 저장하지 않고 종료
                     await guard_send({"type": "error", "message": "empty_assistant_response", "turn_dropped": True})
                     continue
+                assistant_text, end_by_token = extract_end_session_marker(assistant_text)
+                if current_step >= 11 or end_by_token:
+                    assistant_text = build_fixed_farewell()
+                    end_by_token = True
 
                 # ② 사용자/어시스턴트 스텝을 한 트랜잭션으로 커밋
                 try:
@@ -804,7 +816,11 @@ async def ws_emotion(websocket: WebSocket):
                     ).model_dump()
                 )
 
-                if want_close:
+                if current_step >= 11 or end_by_token:
+                    try:
+                        await _with_db(_mark_session_ended, session_id)
+                    except Exception:
+                        logger.exception("WS session end update failed")
                     await guard_send({"type": "suggest_close"})
                 
                 if want_activity:

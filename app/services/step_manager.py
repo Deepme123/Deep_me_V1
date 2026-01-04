@@ -8,6 +8,10 @@ from typing import Callable, Iterable, List
 from app.models.emotion import EmotionStep
 
 SOFT_TIMEOUT_TURNS = int(os.getenv("SOFT_TIMEOUT_TURNS", "3"))
+END_SESSION_TOKEN = "__END_SESSION__"
+END_SESSION_FAREWELL_WORDS = [
+    "고마워", "오늘", "함께", "해줘서", "잘", "지냈어", "또", "보자"
+]
 
 
 @dataclass(frozen=True)
@@ -205,6 +209,19 @@ def build_step_context(current_step: int) -> str:
     )
 
 
+def build_end_session_context(current_step: int) -> str:
+    step = _clamp_step(current_step)
+    if step < MAX_STEP:
+        return ""
+    farewell = build_fixed_farewell()
+    return (
+        "[SESSION END]\n"
+        "rule: send the farewell exactly once and include the token exactly once.\n"
+        f"farewell: {farewell}\n"
+        f"token: {END_SESSION_TOKEN}"
+    )
+
+
 _SOFT_HINTS = {
     1: "Keep greeting short, then invite a small next share without pressing.",
     2: "Name the feeling softly and mirror the intensity; offer 2 gentle labels.",
@@ -236,3 +253,16 @@ def build_soft_timeout_hint(steps: List[EmotionStep], pending_user_text: str) ->
         "rule: keep the current step; change response strategy only.\n"
         f"hint: {hint}"
     )
+
+
+def extract_end_session_marker(text: str) -> tuple[str, bool]:
+    if not text:
+        return "", False
+    if END_SESSION_TOKEN not in text:
+        return text, False
+    cleaned = text.replace(END_SESSION_TOKEN, "").strip()
+    return cleaned, True
+
+
+def build_fixed_farewell() -> str:
+    return " ".join(END_SESSION_FAREWELL_WORDS)

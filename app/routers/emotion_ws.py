@@ -47,6 +47,8 @@ from app.services.step_manager import (
     build_soft_timeout_hint,
     build_step_context,
     extract_end_session_marker,
+    get_step_name,
+    step_after_turn,
     step_for_prompt,
 )
 
@@ -343,6 +345,7 @@ def _prepare_message_context(db: Session, session_id: UUID, user_text: str) -> d
     end_session_context = build_end_session_context(current_step)
     soft_timeout_hint = build_soft_timeout_hint(steps, user_text)
     return {
+        "steps": steps,
         "want_activity": want_activity,
         "user_order": user_order,
         "assistant_order": assistant_order,
@@ -709,6 +712,7 @@ async def ws_emotion(websocket: WebSocket):
 
                 try:
                     prep = await _with_db(_prepare_message_context, session_id, user_text)
+                    steps = prep.get("steps") or []
                     want_activity = bool(prep.get("want_activity"))
                     user_order = int(prep.get("user_order") or 0)
                     assistant_order = int(prep.get("assistant_order") or 0)
@@ -789,6 +793,7 @@ async def ws_emotion(websocket: WebSocket):
                 if current_step >= 11 or end_by_token:
                     assistant_text = build_fixed_farewell()
                     end_by_token = True
+                new_step = step_after_turn(steps, user_text, assistant_text)
 
                 # ② 사용자/어시스턴트 스텝을 한 트랜잭션으로 커밋
                 try:
@@ -814,6 +819,13 @@ async def ws_emotion(websocket: WebSocket):
                         type="message",
                         message=assistant_text,
                     ).model_dump()
+                )
+                await guard_send(
+                    {
+                        "type": "step",
+                        "step": new_step,
+                        "step_name": get_step_name(new_step),
+                    }
                 )
 
                 if current_step >= 11 or end_by_token:

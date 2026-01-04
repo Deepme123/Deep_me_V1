@@ -209,6 +209,11 @@ def build_step_context(current_step: int) -> str:
     )
 
 
+def get_step_name(current_step: int) -> str:
+    step = _clamp_step(current_step)
+    return STEP_METADATA[step - 1].name
+
+
 def build_end_session_context(current_step: int) -> str:
     step = _clamp_step(current_step)
     if step < MAX_STEP:

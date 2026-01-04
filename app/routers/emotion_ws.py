@@ -43,6 +43,7 @@ from app.services.convo_policy import (
     _turn_count,
     ACTIVITY_STEP_TYPE,
 )
+from app.services.step_manager import build_step_context, step_for_prompt
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -336,12 +337,16 @@ def _prepare_message_context(db: Session, session_id: UUID, user_text: str) -> d
     user_order = last_order + 1
     assistant_order = user_order + 1
     convo = _steps_to_conversation(steps_for_convo) + [("user", user_text)]
+    current_step = step_for_prompt(steps, user_text)
+    step_context = build_step_context(current_step)
     return {
         "want_activity": want_activity,
         "want_close": want_close,
         "user_order": user_order,
         "assistant_order": assistant_order,
         "conversation": convo,
+        "current_step": current_step,
+        "step_context": step_context,
     }
 
 def _commit_full_turn(
@@ -702,6 +707,7 @@ async def ws_emotion(websocket: WebSocket):
                     user_order = int(prep.get("user_order") or 0)
                     assistant_order = int(prep.get("assistant_order") or 0)
                     convo = prep.get("conversation") or []
+                    step_context = prep.get("step_context") or ""
                 except TurnLimitReached:
                     await guard_send({"type": "limit", "message": "max turns reached"})
                     continue
@@ -716,6 +722,8 @@ async def ws_emotion(websocket: WebSocket):
                 # 프롬프트 로딩 + MARK C
                 try:
                     system_prompt = get_system_prompt()
+                    if step_context:
+                        system_prompt = f"{system_prompt}\n\n{step_context}"
                     task_prompt = get_task_prompt() if want_activity else None
                 except Exception as e:
                     logger.exception("WS prompt load failed")

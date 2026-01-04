@@ -9,6 +9,7 @@ from app.core.prompt_loader import get_system_prompt, get_task_prompt
 from app.db.session import get_session
 from app.dependencies.auth import get_current_user_optional
 from app.models.emotion import EmotionSession, EmotionStep
+from app.services.step_manager import build_step_context, step_for_prompt
 from app.schemas.emotion import (
     EmotionSessionCreate,
     EmotionSessionRead,
@@ -28,6 +29,16 @@ from app.services.llm_service import generate_noa_response
 from app.services.web_test_user import resolve_emotion_user_id
 
 router = APIRouter(prefix="/emotion", tags=["Emotion"])
+
+
+def _steps_to_conversation(steps: list[EmotionStep]) -> list[tuple[str, str]]:
+    convo: list[tuple[str, str]] = []
+    for s in steps:
+        if s.step_type == "user" and s.user_input:
+            convo.append(("user", s.user_input))
+        elif s.step_type == "assistant" and s.gpt_response:
+            convo.append(("assistant", s.gpt_response))
+    return convo
 
 
 def _emotion_user_id(
@@ -151,6 +162,8 @@ def generate_emotion_step(
 
     # ?œìŠ¤???„ë¡¬?„íŠ¸ ì¡°ë¦½
     system_prompt = get_system_prompt()
+    step_context = build_step_context(step_for_prompt(recent_all, input_data.user_input))
+    system_prompt = f"{system_prompt}\n\n{step_context}"
     activity_turn = is_activity_turn(
         user_text=input_data.user_input,
         db=db,
@@ -159,8 +172,7 @@ def generate_emotion_step(
     )
     closing_turn = is_closing_turn(db, input_data.session_id)
 
-    if activity_turn:
-        system_prompt = f"{system_prompt}\n\n{get_task_prompt()}"
+    task_prompt = get_task_prompt() if activity_turn else None
 
     if closing_turn:
         system_prompt = f"""{system_prompt}
@@ -174,10 +186,13 @@ def generate_emotion_step(
 """
 
     # LLM ?‘ë‹µ ?ì„±
+    convo = _steps_to_conversation(recent_all) + [("user", input_data.user_input)]
     response = generate_noa_response(
-        input_data=input_data,
         system_prompt=system_prompt,
-        recent_steps=recent_all,
+        task_prompt=task_prompt,
+        conversation=convo,
+        temperature=input_data.temperature,
+        max_tokens=input_data.max_completion_tokens,
     )
 
     # ?¤í… ?€???œë²„?ì„œ step_order ë¶€?? ??WebSocketê³??™ì¼???œì„œ(user?’assistant?’activity)
